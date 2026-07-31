@@ -36,6 +36,7 @@
 
 #include "emu.h"
 #include "cpu/nec/nec.h"
+#include "machine/timer.h"
 
 
 namespace {
@@ -46,7 +47,8 @@ public:
 	wltc_state(const machine_config &mconfig, device_type type, const char *tag) :
 		driver_device(mconfig, type, tag),
 		m_maincpu(*this, "maincpu"),
-		m_shadow(*this, "shadow")
+		m_shadow(*this, "shadow"),
+		m_lowram(*this, "lowram")
 	{ }
 
 	void wltc(machine_config &config);
@@ -57,6 +59,8 @@ protected:
 private:
 	required_device<v30_device> m_maincpu;
 	required_shared_ptr<uint16_t> m_shadow;
+	required_shared_ptr<uint16_t> m_lowram;
+	bool m_boot_mirror = false;
 
 	void mem_map(address_map &map) ATTR_COLD;
 	void io_map(address_map &map) ATTR_COLD;
@@ -64,6 +68,13 @@ private:
 	// temporary reconnaissance handlers: log every I/O access with the PC
 	uint16_t io_r(offs_t offset, uint16_t mem_mask);
 	void io_w(offs_t offset, uint16_t data, uint16_t mem_mask);
+
+	// experimental tick source: the cold start parks at EB30B in a
+	// hlt/inc cx loop waiting for timer ticks; the gate array delivers
+	// them on one of the hardware vectors 8B/8D/91/95 (the patched
+	// dispatch stubs). Fire 8B at 60 Hz until the real timer is found.
+	TIMER_DEVICE_CALLBACK_MEMBER(tick) { m_maincpu->set_input_line(0, HOLD_LINE); }
+	IRQ_CALLBACK_MEMBER(irq_ack) { return 0x8b; }
 };
 
 
@@ -71,12 +82,29 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 {
 	if (!machine().side_effects_disabled())
 		logerror("%06x: io_r %04x mask %04x\n", m_maincpu->pc(), offset << 1, mem_mask);
+	// 0x2a08 bit 7 is polled as a busy flag after writing a command to
+	// 0x2c1e (keyboard controller handshake?): report idle
+	if ((offset << 1) == 0x2a08)
+		return 0x0000;
 	return 0xffff;
 }
 
 void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
 	logerror("%06x: io_w %04x = %04x mask %04x\n", m_maincpu->pc(), offset << 1, data, mem_mask);
+
+	// The write to port 0x204 happens right between the table-driven init
+	// phase (which still reads the boot EPROM mirror through segment
+	// 0x40) and the keyboard handshake (which needs RAM flags at
+	// 0x417/0x418): treat it as the mirror disable until the real
+	// mechanism is identified.
+	if ((offset << 1) == 0x204 && m_boot_mirror)
+	{
+		logerror("boot mirror disabled\n");
+		m_maincpu->space(AS_PROGRAM).install_ram(0x00400, 0x103ff,
+				reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x400);
+		m_boot_mirror = false;
+	}
 }
 
 
@@ -88,12 +116,13 @@ void wltc_state::machine_reset()
 	// shadow enable). Model it as RAM preloaded from the EPROMs.
 	memcpy(m_shadow, memregion("bios")->base(), 0x20000);
 
-	// At reset the BIOS EPROMs are also mirrored (read only) from 0x400
-	// up: the cold start runs there as CS=0x0040, pulls constants through
-	// a pseudo-stack whose pops read ROM bytes, and copies the BIOS into
-	// the shadow RAM at 0xe0000 before jumping to it. Writes are
-	// discarded while the mirror is active.
+	// At reset the EPROMs are mirrored (read only, writes discarded) from
+	// 0x400 up: the cold start copies its first page from there and the
+	// init phase keeps reading data tables through segment 0x40. The
+	// mirror goes away mid-POST (see io_w on port 0x204), after which
+	// segment 0x40 becomes the BIOS low data area in RAM.
 	m_maincpu->space(AS_PROGRAM).install_rom(0x00400, 0x103ff, memregion("bios")->base());
+	m_boot_mirror = true;
 
 	// The reset vector executes mov al,0x10 / int 0x88, so something must
 	// provide a valid INT 88h vector at power-on: on real hardware most
@@ -107,7 +136,7 @@ void wltc_state::machine_reset()
 
 void wltc_state::mem_map(address_map &map)
 {
-	map(0x00000, 0x7ffff).ram();
+	map(0x00000, 0x7ffff).ram().share("lowram");
 	map(0xe0000, 0xfffff).ram().share("shadow");
 }
 
@@ -126,6 +155,9 @@ void wltc_state::wltc(machine_config &config)
 	V30(config, m_maincpu, 8'000'000); // NEC D70116C-8
 	m_maincpu->set_addrmap(AS_PROGRAM, &wltc_state::mem_map);
 	m_maincpu->set_addrmap(AS_IO, &wltc_state::io_map);
+	m_maincpu->set_irq_acknowledge_callback(FUNC(wltc_state::irq_ack));
+
+	TIMER(config, "tick").configure_periodic(FUNC(wltc_state::tick), attotime::from_hz(60));
 }
 
 
