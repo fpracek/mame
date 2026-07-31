@@ -82,10 +82,18 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 {
 	if (!machine().side_effects_disabled())
 		logerror("%06x: io_r %04x mask %04x\n", m_maincpu->pc(), offset << 1, mem_mask);
-	// 0x2a08 bit 7 is polled as a busy flag after writing a command to
-	// 0x2c1e (keyboard controller handshake?): report idle
-	if ((offset << 1) == 0x2a08)
-		return 0x0000;
+	// idle values measured on the real machine (LCD model) with DEBUG:
+	switch (offset << 1)
+	{
+	case 0x2a08: return 0x0044; // handshake status, bit7 = busy, measured idle
+	case 0x2b02: return 0x00fe; // measured 0xfc idle; bit1 (ready to accept) forced high
+	case 0x2e1e: return 0x00f4; // mode/config register, measured on real hardware:
+	                            // 0xf4 in Wang mode, 0xfc in Industry Standard mode
+	                            // (bit3 = IS mode); bit7=1 (display type, LCD) selects
+	                            // the 0xde/0xbb constant set at POST
+	}
+	// reads of 0x2a00 must NOT return the 0xdb probe signature: the
+	// optional device is absent on the reference machine too
 	return 0xffff;
 }
 
