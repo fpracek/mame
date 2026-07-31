@@ -49072,6 +49072,9 @@ innotab2
 @source:wang/wangpc.cpp
 wangpc
 
+@source:wang/wltc.cpp
+wltc
+
 @source:wavemate/bullet.cpp
 wmbullet
 wmbulletf
