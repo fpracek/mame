@@ -37,6 +37,7 @@
 #include "emu.h"
 #include "cpu/nec/nec.h"
 #include "machine/timer.h"
+#include "screen.h"
 
 
 namespace {
@@ -80,6 +81,11 @@ private:
 	uint16_t fseg_r(offs_t offset, uint16_t mem_mask);
 	void fseg_w(offs_t offset, uint16_t data, uint16_t mem_mask);
 
+	// LCD: render the captured VRAM window (0xf2000+) as a 320x200
+	// 1bpp bitmap, the Industry Standard graphics geometry from the
+	// maintenance manual, until the real controller is understood
+	uint32_t screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
+
 	// Tick source: the real-hardware IVT dump shows the hardware
 	// interrupts on vectors 0x80-0x87 (the D71059 at IBM-style 0x20/0x21
 	// is programmed with vector base 0x80; measured IMR 0xbc = IRQ0
@@ -89,6 +95,23 @@ private:
 	IRQ_CALLBACK_MEMBER(irq_ack) { return 0x80; }
 };
 
+
+uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
+{
+	// LCD yellow-green on dark, like the real display
+	const rgb_t fg(0x30, 0x38, 0x20), bg(0xc8, 0xd4, 0x40);
+	auto const *vram = reinterpret_cast<const uint8_t *>(m_fram.target()) + 0x2000;
+	for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
+	{
+		uint32_t *dst = &bitmap.pix(y, cliprect.left());
+		for (int x = cliprect.left(); x <= cliprect.right(); x++)
+		{
+			uint8_t const b = vram[y * 40 + (x >> 3)];
+			*dst++ = BIT(b, 7 - (x & 7)) ? fg : bg;
+		}
+	}
+	return 0;
+}
 
 uint16_t wltc_state::fseg_r(offs_t offset, uint16_t mem_mask)
 {
@@ -232,6 +255,12 @@ void wltc_state::wltc(machine_config &config)
 	m_maincpu->set_irq_acknowledge_callback(FUNC(wltc_state::irq_ack));
 
 	TIMER(config, "tick").configure_periodic(FUNC(wltc_state::tick), attotime::from_hz(60));
+
+	screen_device &screen(SCREEN(config, "screen", SCREEN_TYPE_LCD));
+	screen.set_refresh_hz(60);
+	screen.set_size(320, 200);
+	screen.set_visarea(0, 319, 0, 199);
+	screen.set_screen_update(FUNC(wltc_state::screen_update));
 }
 
 
