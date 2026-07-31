@@ -141,6 +141,19 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 				reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x400);
 		m_boot_mirror = false;
 	}
+
+	// Writing 1 to port 0x2b1e triggers a CPU reset and advances the
+	// boot phase: the gate array swaps the INT 88h vector from the
+	// phase-A hardware init entry (E000:0019, the relocating start with
+	// the boot mirror) to the runtime AL-function dispatcher
+	// (E000:0643, the value observed on a running machine). Only the
+	// CPU resets: shadow RAM and the rest of the IVT survive.
+	if ((offset << 1) == 0x2b1e && (data & 1))
+	{
+		logerror("cpu reset via 2b1e, INT88 vector -> phase B init\n");
+		m_maincpu->space(AS_PROGRAM).write_dword(0x88 * 4, 0xe0000019);
+		m_maincpu->pulse_input_line(INPUT_LINE_RESET, attotime::zero);
+	}
 }
 
 
@@ -172,6 +185,10 @@ void wltc_state::machine_reset()
 	// the original ROM dispatch stubs), so the same block plausibly
 	// gets seeded at reset. INT 88h = E000:0643, whose AL dispatcher
 	// handles the cold start function AL=0x10.
+	// INT 88h starts at the E000:0643 AL dispatcher (the constant the
+	// live machine shows): phase A = function 0x10 programs the gate
+	// array and hits port 0x2b1e, which resets the CPU with the vector
+	// swapped to the phase-B hardware init entry E000:0019.
 	static const uint32_t ivt_seed[16] = {
 		0xe00000f1, 0xe0000148, 0xe0000177, 0xe00001d0,  // 80-83: IRQ0-3
 		0xe000020d, 0xe0000263, 0xe00002b8, 0xe00002e3,  // 84-87: IRQ4-7
