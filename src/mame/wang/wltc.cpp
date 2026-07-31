@@ -69,12 +69,13 @@ private:
 	uint16_t io_r(offs_t offset, uint16_t mem_mask);
 	void io_w(offs_t offset, uint16_t data, uint16_t mem_mask);
 
-	// experimental tick source: the cold start parks at EB30B in a
-	// hlt/inc cx loop waiting for timer ticks; the gate array delivers
-	// them on one of the hardware vectors 8B/8D/91/95 (the patched
-	// dispatch stubs). Fire 8B at 60 Hz until the real timer is found.
+	// Tick source: the real-hardware IVT dump shows the hardware
+	// interrupts on vectors 0x80-0x87 (the D71059 at IBM-style 0x20/0x21
+	// is programmed with vector base 0x80; measured IMR 0xbc = IRQ0
+	// timer, IRQ1 keyboard, IRQ6 floppy enabled). Fire IRQ0 = INT 80h
+	// at 60 Hz until the PIT/PIC pair is properly emulated.
 	TIMER_DEVICE_CALLBACK_MEMBER(tick) { m_maincpu->set_input_line(0, HOLD_LINE); }
-	IRQ_CALLBACK_MEMBER(irq_ack) { return 0x8b; }
+	IRQ_CALLBACK_MEMBER(irq_ack) { return 0x80; }
 };
 
 
