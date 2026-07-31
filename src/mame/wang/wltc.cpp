@@ -119,11 +119,11 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 
 void wltc_state::machine_reset()
 {
-	// The BIOS runs from RAM shadowed over 0xe0000-0xfffff: the cold start
-	// code patches its own dispatch stubs at 0xe0004+ and copies data into
-	// the E segment right after writing 0xfe to port 0x2d06 (probably the
-	// shadow enable). Model it as RAM preloaded from the EPROMs.
-	memcpy(m_shadow, memregion("bios")->base(), 0x20000);
+	// The BIOS runs the E segment from RAM shadowed over the EPROMs: the
+	// cold start patches its own dispatch stubs at 0xe0004+ and keeps
+	// data and stacks in segment E35F. Preload the shadow from the
+	// EPROMs; the F segment stays ROM.
+	memcpy(m_shadow, memregion("bios")->base(), 0x10000);
 
 	// At reset the EPROMs are mirrored (read only, writes discarded) from
 	// 0x400 up: the cold start copies its first page from there and the
@@ -146,7 +146,12 @@ void wltc_state::machine_reset()
 void wltc_state::mem_map(address_map &map)
 {
 	map(0x00000, 0x7ffff).ram().share("lowram");
-	map(0xe0000, 0xfffff).ram().share("shadow");
+	// E segment = shadow RAM (the BIOS patches its stubs and keeps its
+	// data segment E35F there); F segment = plain ROM: the real machine
+	// preserves the EPROM content there at runtime (verified against a
+	// live dump at F000:30E2), so BIOS writes to it must be discarded.
+	map(0xe0000, 0xeffff).ram().share("shadow");
+	map(0xf0000, 0xfffff).rom().region("bios", 0x10000);
 }
 
 void wltc_state::io_map(address_map &map)
