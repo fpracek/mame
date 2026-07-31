@@ -48,7 +48,8 @@ public:
 		driver_device(mconfig, type, tag),
 		m_maincpu(*this, "maincpu"),
 		m_shadow(*this, "shadow"),
-		m_lowram(*this, "lowram")
+		m_lowram(*this, "lowram"),
+		m_fram(*this, "fram")
 	{ }
 
 	void wltc(machine_config &config);
@@ -60,7 +61,9 @@ private:
 	required_device<v30_device> m_maincpu;
 	required_shared_ptr<uint16_t> m_shadow;
 	required_shared_ptr<uint16_t> m_lowram;
+	required_shared_ptr<uint16_t> m_fram;
 	bool m_boot_mirror = false;
+	std::vector<uint8_t> m_fseg_logged;
 
 	void mem_map(address_map &map) ATTR_COLD;
 	void io_map(address_map &map) ATTR_COLD;
@@ -68,6 +71,14 @@ private:
 	// temporary reconnaissance handlers: log every I/O access with the PC
 	uint16_t io_r(offs_t offset, uint16_t mem_mask);
 	void io_w(offs_t offset, uint16_t data, uint16_t mem_mask);
+
+	// F segment: reads come from the EPROMs (verified on real hardware),
+	// but the video subsystem accepts writes there (VRAM around 0xf2000,
+	// parameter registers at 0xf13xx/0xf18xx/0xf20xx/0xf22xx). Capture
+	// every write into a side buffer, mirrored as plain RAM at 0xa0000
+	// for inspection, and log the first write to each word address.
+	uint16_t fseg_r(offs_t offset, uint16_t mem_mask);
+	void fseg_w(offs_t offset, uint16_t data, uint16_t mem_mask);
 
 	// Tick source: the real-hardware IVT dump shows the hardware
 	// interrupts on vectors 0x80-0x87 (the D71059 at IBM-style 0x20/0x21
@@ -78,6 +89,22 @@ private:
 	IRQ_CALLBACK_MEMBER(irq_ack) { return 0x80; }
 };
 
+
+uint16_t wltc_state::fseg_r(offs_t offset, uint16_t mem_mask)
+{
+	return reinterpret_cast<const uint16_t *>(memregion("bios")->base() + 0x10000)[offset];
+}
+
+void wltc_state::fseg_w(offs_t offset, uint16_t data, uint16_t mem_mask)
+{
+	COMBINE_DATA(&m_fram[offset]);
+	if (!m_fseg_logged[offset])
+	{
+		m_fseg_logged[offset] = 1;
+		logerror("%06x: fseg_w %05x = %04x mask %04x\n",
+				m_maincpu->pc(), 0xf0000 + (offset << 1), data, mem_mask);
+	}
+}
 
 uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 {
@@ -122,8 +149,9 @@ void wltc_state::machine_reset()
 	// The BIOS runs the E segment from RAM shadowed over the EPROMs: the
 	// cold start patches its own dispatch stubs at 0xe0004+ and keeps
 	// data and stacks in segment E35F. Preload the shadow from the
-	// EPROMs; the F segment stays ROM.
+	// EPROMs; the F segment stays ROM for reads.
 	memcpy(m_shadow, memregion("bios")->base(), 0x10000);
+	m_fseg_logged.assign(0x8000, 0);
 
 	// At reset the EPROMs are mirrored (read only, writes discarded) from
 	// 0x400 up: the cold start copies its first page from there and the
@@ -146,12 +174,15 @@ void wltc_state::machine_reset()
 void wltc_state::mem_map(address_map &map)
 {
 	map(0x00000, 0x7ffff).ram().share("lowram");
+	// debug window: mirror of everything the BIOS writes into the F
+	// segment (VRAM and video registers), readable from Lua for dumps
+	map(0xa0000, 0xaffff).ram().share("fram");
 	// E segment = shadow RAM (the BIOS patches its stubs and keeps its
-	// data segment E35F there); F segment = plain ROM: the real machine
-	// preserves the EPROM content there at runtime (verified against a
-	// live dump at F000:30E2), so BIOS writes to it must be discarded.
+	// data segment E35F there); F segment: reads from ROM (the real
+	// machine preserves the EPROM content at runtime, verified live),
+	// writes captured by the video-window handler.
 	map(0xe0000, 0xeffff).ram().share("shadow");
-	map(0xf0000, 0xfffff).rom().region("bios", 0x10000);
+	map(0xf0000, 0xfffff).rw(FUNC(wltc_state::fseg_r), FUNC(wltc_state::fseg_w));
 }
 
 void wltc_state::io_map(address_map &map)
