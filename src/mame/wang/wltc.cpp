@@ -137,7 +137,7 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	if ((offset << 1) == 0x204 && m_boot_mirror)
 	{
 		logerror("boot mirror disabled\n");
-		m_maincpu->space(AS_PROGRAM).install_ram(0x00400, 0x103ff,
+		m_maincpu->space(AS_PROGRAM).install_ram(0x00400, 0x03fff,
 				reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x400);
 		m_boot_mirror = false;
 	}
@@ -158,16 +158,28 @@ void wltc_state::machine_reset()
 	// init phase keeps reading data tables through segment 0x40. The
 	// mirror goes away mid-POST (see io_w on port 0x204), after which
 	// segment 0x40 becomes the BIOS low data area in RAM.
-	m_maincpu->space(AS_PROGRAM).install_rom(0x00400, 0x103ff, memregion("bios")->base());
+	// The mirror only needs to cover the boot-time ROM reads (copy
+	// source at 0x400-0x4ff, walk data tables up to ~0x39ff): the top
+	// of segment 0 must stay RAM, the INT 88h dispatcher builds its
+	// manufactured interrupt frames on a stack at 0000:FFEx.
+	m_maincpu->space(AS_PROGRAM).install_rom(0x00400, 0x03fff, memregion("bios")->base());
 	m_boot_mirror = true;
 
-	// The reset vector executes mov al,0x10 / int 0x88, so something must
-	// provide a valid INT 88h vector at power-on: on real hardware most
-	// likely one of the Wang gate arrays. Point it at the cold start
-	// entry E000:0019: the startup then runs in the shadow RAM, uses a
-	// stack right below E000:0034, and refreshes E000:0000-0100 from the
-	// low ROM mirror before jumping to E000:0070.
-	m_maincpu->space(AS_PROGRAM).write_dword(0x88 * 4, 0xe0000019);
+	// The reset vector executes mov al,0x10 / int 0x88, so the gate
+	// array must seed the interrupt vector table at power-on. Use the
+	// vectors read from a running machine with DEBUG (D 0:200 L 40):
+	// they are position-independent ROM entry points (8B/8D even match
+	// the original ROM dispatch stubs), so the same block plausibly
+	// gets seeded at reset. INT 88h = E000:0643, whose AL dispatcher
+	// handles the cold start function AL=0x10.
+	static const uint32_t ivt_seed[16] = {
+		0xe00000f1, 0xe0000148, 0xe0000177, 0xe00001d0,  // 80-83: IRQ0-3
+		0xe000020d, 0xe0000263, 0xe00002b8, 0xe00002e3,  // 84-87: IRQ4-7
+		0xe0000643, 0xe00000eb, 0xe0000384, 0xe25f0000,  // 88-8B
+		0xe0000384, 0xe33201e4, 0xe0000384, 0xe0000384   // 8C-8F
+	};
+	for (int i = 0; i < 16; i++)
+		m_maincpu->space(AS_PROGRAM).write_dword((0x80 + i) * 4, ivt_seed[i]);
 }
 
 
