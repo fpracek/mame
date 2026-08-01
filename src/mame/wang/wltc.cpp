@@ -87,13 +87,23 @@ private:
 	// maintenance manual, until the real controller is understood
 	uint32_t screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
 
-	// Tick source: the real-hardware IVT dump shows the hardware
+	// Interrupt sources: the real-hardware IVT dump shows the hardware
 	// interrupts on vectors 0x80-0x87 (the D71059 at IBM-style 0x20/0x21
 	// is programmed with vector base 0x80; measured IMR 0xbc = IRQ0
-	// timer, IRQ1 keyboard, IRQ6 floppy enabled). Fire IRQ0 = INT 80h
-	// at 60 Hz until the PIT/PIC pair is properly emulated.
-	TIMER_DEVICE_CALLBACK_MEMBER(tick) { m_maincpu->set_input_line(0, HOLD_LINE); }
-	IRQ_CALLBACK_MEMBER(irq_ack) { return 0x80; }
+	// timer, IRQ1 keyboard, IRQ6 floppy enabled). Until the PIT/PIC
+	// pair is properly emulated: periodic tick on IRQ0, and a keyboard
+	// microcontroller reply interrupt on IRQ1 shortly after each
+	// command byte written to port 0x2c1e.
+	uint8_t m_irq_vector = 0x80;
+	uint8_t m_kb_reply = 0;
+	TIMER_DEVICE_CALLBACK_MEMBER(tick) { m_irq_vector = 0x80; m_maincpu->set_input_line(0, HOLD_LINE); }
+	TIMER_CALLBACK_MEMBER(kb_reply_cb)
+	{
+		m_irq_vector = 0x81;
+		m_maincpu->set_input_line(0, HOLD_LINE);
+	}
+	emu_timer *m_kb_timer = nullptr;
+	IRQ_CALLBACK_MEMBER(irq_ack) { uint8_t v = m_irq_vector; m_irq_vector = 0x80; return v; }
 };
 
 
@@ -163,6 +173,8 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	// idle values measured on the real machine (LCD model) with DEBUG:
 	switch (offset << 1)
 	{
+	case 0x204:  return 0x0000; // boot-time device status, bit0 tested after read
+	                            // (experiment: report clear; reads 0xff at DOS time)
 	case 0x2a08: return 0x0044; // handshake status, bit7 = busy, measured idle
 	case 0x2b02: return 0x00fe; // measured 0xfc idle; bit1 (ready to accept) forced high
 	case 0x2e1e: return 0x00f4; // mode/config register, measured on real hardware:
@@ -178,6 +190,19 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
 	logerror("%06x: io_w %04x = %04x mask %04x\n", m_maincpu->pc(), offset << 1, data, mem_mask);
+
+	// A command byte written to the keyboard microcontroller data port
+	// 0x2c1e gets a reply interrupt (IRQ1 -> INT 81h) shortly after:
+	// the reply byte is latched for whatever data port the ISR reads
+	// (reconnaissance: watch the io_r log after this fires).
+	if ((offset << 1) == 0x2c1e)
+	{
+		m_kb_reply = 0xfa;  // ack-style reply until the protocol is known
+		if (!m_kb_timer)
+			m_kb_timer = timer_alloc(FUNC(wltc_state::kb_reply_cb), this);
+		m_kb_timer->adjust(attotime::from_usec(200));
+		logerror("kb cmd %02x -> reply irq scheduled\n", data & 0xff);
+	}
 
 	// Writing 1 to port 0x2b1e triggers a CPU reset and advances the
 	// boot phase: the gate array swaps the INT 88h vector from the
