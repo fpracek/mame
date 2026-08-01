@@ -571,8 +571,30 @@ void wltc_state::machine_reset()
 	// copy, and nothing between there and the far call sets it. Feeding
 	// the routine DS=E35F and SI=0x3a03 by hand gets the POST to
 	// rasterise its first line of text, so the rest of the machine is
-	// close; what establishes that state on real hardware is the open
-	// question.
+	// close.
+	//
+	// Who establishes that state on real hardware is now known, and it
+	// is not the ROM POST at all. The whole display bring-up - the BDA
+	// clear at EEF25, the descriptor walk calling the setup at EF478,
+	// the glyph load at EF572 - lives inside a MS-DOS device driver
+	// module embedded in the EPROM at segment E718: canonical driver
+	// headers (CLOCK$, COM1, LPT1) at E718:1EB0 with a thirteen-command
+	// dispatch at E718:1F2C, a strategy/interrupt pair at E906E that
+	// reads the DOS request header from ES:BX, and a relocatable entry
+	// at EEC03 that computes its own load delta with sub ax,0x75b and
+	// fixes up the stored segment constants - 0x075b being the segment
+	// the boot loader puts BIOS.SYS at on a disk boot. The 4.00 BIOS.SYS
+	// recovered from the system diskette is this same module as a file.
+	//
+	// So the banner is printed at DOS boot time, when the kernel calls
+	// the console driver's INIT with a proper frame: DS comes from the
+	// driver's relocated data-segment constant, not from anything the
+	// cold start does. The ROM-resident cold start only initialises the
+	// hardware and runs the video test, which is exactly as far as the
+	// emulated machine currently gets - matching a real WLTC that fails
+	// to load MSDOS320.SYS. Getting the text on screen without patching
+	// therefore means booting DOS from a disk image, which needs the
+	// floppy/SCSI path to work.
 	//
 	// It is not that E0084 is entered from somewhere else. Offset 0x0084
 	// has no reference anywhere in the 128K of EPROM - no near call or
