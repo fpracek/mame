@@ -440,15 +440,6 @@ void wltc_state::machine_reset()
 	// vector is an ordinary far jump (ea aa 00 00 fc = jmp FC00:00AA),
 	// not the int 0x88 convention: none of the gate-array scaffolding
 	// below (shadow RAM, boot mirror, seeded IVT) applies to it.
-	// Boot patches, applied to the ROM image before it is copied into
-	// the shadow: the init routine at E4C2 starts at offset 0x63 (the
-	// bytes before it are a data table, as the stack accounting and a
-	// dump of a running machine both show), and its final return has
-	// to be a far one, since it is reached through a far call - a near
-	// return would keep CS at E4C2 and land mid-instruction at E4CA4.
-	memregion("bios")->base()[0x0080] = 0x63;
-	memregion("bios")->base()[0x4d56] = 0xcb;
-
 	uint8_t const *const bios = memregion("bios")->base();
 	m_legacy_bios = (bios[0] == 0xff && bios[1] == 0xff);   // E half blank: 64K image
 	if (m_legacy_bios)
@@ -479,6 +470,30 @@ void wltc_state::machine_reset()
 	m_maincpu->space(AS_PROGRAM).install_writeonly(0x10000, 0x103ff,
 			reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x10000);
 	m_boot_mirror = true;
+
+	// The BIOS builds dispatch stubs in its shadow RAM - the cold start
+	// patches the ones at E000:0004 and up - and the entry to the init
+	// segment is one of them. The ROM image holds a data table at
+	// E4C2:0000-0062 (stack accounting says executing it leaves five
+	// words behind, and a dump of a running machine shows a runtime
+	// table there), while the code starts at E4C2:0063 and ends in a
+	// near return. Both fit exactly one shape of stub:
+	//
+	//     E4C2:0000  call 0x0063     ; near, pushes 0x0003
+	//     E4C2:0003  retf            ; pops the far frame of the caller
+	//
+	// so the far call at E000:007f lands on the stub, the near return
+	// at the end of the init comes back to the retf, and the retf
+	// returns to E000:0084 - every original instruction correct, no
+	// patching of the ROM. What writes the stub on real hardware is
+	// still unknown; installing it here stands in for that.
+	{
+		uint8_t *const shadow = reinterpret_cast<uint8_t *>(m_shadow.target());
+		shadow[0x4c20] = 0xe8;  // call near
+		shadow[0x4c21] = 0x60;  // 0x0003 + 0x0060 = 0x0063
+		shadow[0x4c22] = 0x00;
+		shadow[0x4c23] = 0xcb;  // retf
+	}
 
 	// The bytes at E4C2:0000-0062 are data, not code: executing them
 	// leaves five words on the stack (a push of ES, three of CS and one
