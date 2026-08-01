@@ -72,6 +72,12 @@ public:
 	void wltc(machine_config &config);
 
 protected:
+	virtual void machine_start() override ATTR_COLD
+	{
+		// timers must be allocated before save-state registration closes
+		m_kb_timer = timer_alloc(FUNC(wltc_state::kb_reply_cb), this);
+		m_rtc_timer = timer_alloc(FUNC(wltc_state::rtc_periodic), this);
+	}
 	virtual void machine_reset() override ATTR_COLD;
 
 private:
@@ -178,11 +184,37 @@ private:
 		if (!m_legacy_bios)
 			m_maincpu->set_input_line(0, state ? ASSERT_LINE : CLEAR_LINE);
 	}
+	// The 1986 gate-array interrupt scheme: sources are hard-vectored
+	// (counter 1 -> 0x20, counter 2 -> 0x21, keyboard -> 0x25), each
+	// enabled by an active-low bit in port 0x2202 (0/1/5). The POST
+	// swaps the handler behind a vector and re-runs the same test
+	// against the other counter, so answering a fixed vector sends the
+	// second counter's interrupt to the default handler that its
+	// cleanup just installed - measured as BP never getting the status
+	// word. Latch the source's vector at the OUT edge.
+	uint8_t m_int_enable_2202 = 0xff;
+	uint8_t m_gate_vector = 0x20;
+	emu_timer *m_rtc_timer = nullptr;
+	TIMER_CALLBACK_MEMBER(rtc_periodic)
+	{
+		// register C picks up the periodic flag; the interrupt goes out
+		// hard-vectored to 0x25 when its gate-array enable (bit 5 of
+		// 0x2202, active low) is open
+		m_rtc[0x0c] |= 0x41;
+		logerror("RTC tick @ %s (2202=%02x)\n",
+				machine().time().as_string(6), m_int_enable_2202);
+		if (m_legacy_bios && !BIT(m_int_enable_2202, 5))
+		{
+			m_gate_vector = 0x25;
+			m_maincpu->set_input_line(0, HOLD_LINE);
+		}
+	}
+	template <int N>
 	void pit_out_w(int state)
 	{
-		if (m_legacy_bios && state)
+		if (m_legacy_bios && state && !BIT(m_int_enable_2202, N - 1))
 		{
-			logerror("PIT out edge -> INT @ %s\n", machine().time().as_string(6));
+			m_gate_vector = 0x20 + (N - 1);
 			m_maincpu->set_input_line(0, HOLD_LINE);
 		}
 	}
@@ -195,9 +227,10 @@ private:
 		// (F0ECB: [0080] = F000:0F67) before sti. The unprogrammed 8259
 		// returns junk below either base.
 		// the 1986 firmware never initialises the 8259 at all: its
-		// timer interrupt is hard-vectored to 0x20
+		// interrupts carry the vector of whichever gate-array source
+		// fired last
 		if (m_legacy_bios)
-			return 0x20;
+			return m_gate_vector;
 		uint8_t const v = m_pic->acknowledge();
 		return v >= 0x80 ? v : 0x80;
 	}
@@ -308,13 +341,7 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	// write into counter 1 and made the POST timer test read a stale
 	// counter 0, failing "too early" into error 57
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
-	{
-		uint16_t const v = m_pit->read(offset & 3);
-		if (m_legacy_bios && !machine().side_effects_disabled())
-			logerror("PIT r[%d] = %02x @ %s\n", offset & 3, v,
-					machine().time().as_string(6));
-		return v;
-	}
+		return m_pit->read(offset & 3);
 
 	// NCR 53C80 SCSI controller at 0x2700-0x270e, one register every
 	// other address in the standard order (output data, initiator
@@ -346,6 +373,12 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		return m_uart->ins8250_r(reg & 7);
 	}
 
+	// Gate-array interrupt enable register, active low, read-modify-
+	// written by the 1986 POST (bit 0 counter 1, bit 1 counter 2,
+	// bit 5 keyboard)
+	if ((offset << 1) == 0x2202)
+		return 0xff00 | m_int_enable_2202;
+
 	// Configuration word. The 1986 BIOS forks on bit 13 right after
 	// reset (F0012: test aw,2000h): set, it takes the burn-in path at
 	// F07C4 that programs the LCD controller and deliberately powers
@@ -358,9 +391,12 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	// SCSI test at F0FAF asserts RST through the 5380's initiator
 	// command register, expects this bit to rise, clears the interrupt
 	// by reading the reset-parity register at 0x270e and expects it to
-	// fall again.
+	// fall again. Bits 7 and 6 are the counter 1 / counter 2 interrupt
+	// flags the timer ISRs sample into BP. Bits 12 and 11 are error
+	// latches the RTC test requires low - either one high sends it to
+	// the failure message before the tick counting even starts.
 	if ((offset << 1) == 0x2b0a)
-		return 0xdffb | (m_scsi_rst_irq ? 0x0004 : 0);
+		return 0xc7fb | (m_scsi_rst_irq ? 0x0004 : 0);
 
 	// Console status, read by the timer-tick device poller at E11C5 as
 	// port (selector << 8) | 0x62 with the console's selector 0x10. The
@@ -441,6 +477,16 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		// power-on contents in m_rtc.
 		if (m_index_sel == 0x0a)
 			return (machine().time().as_ticks(120) & 1) ? 0x80 : 0x00;
+		// register C, MC146818-style: interrupt flags, cleared by the
+		// read. The keyboard/RTC ISR counts a periodic interrupt as
+		// genuine only when bits 6 and 0 are both set.
+		if (m_index_sel == 0x0c && !machine().side_effects_disabled())
+		{
+			uint8_t const v = m_rtc[0x0c];
+			m_rtc[0x0c] = 0;
+			logerror("RTC regC read = %02x @ %s\n", v, machine().time().as_string(6));
+			return v;
+		}
 		return m_rtc[m_index_sel & 0x3f];
 	case 0x2a08: return 0x0044; // handshake status, bit7 = busy, measured idle
 	case 0x2b02: return 0x00fe; // measured 0xfc idle; bit1 (ready to accept) forced high
@@ -508,11 +554,14 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 					reinterpret_cast<uint8_t *>(m_fram.target()));
 	}
 
+	if ((offset << 1) == 0x2202)
+	{
+		m_int_enable_2202 = data & 0xff;
+		return;
+	}
+
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
 	{
-		if (m_legacy_bios && !machine().side_effects_disabled())
-			logerror("PIT w[%d] = %02x @ %s\n", offset & 3, data & 0xff,
-					machine().time().as_string(6));
 		m_pit->write(offset & 3, data & 0xff);
 		return;
 	}
@@ -578,7 +627,32 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	if ((offset << 1) == 0x2c00)
 		m_index_sel = data & 0xff;
 	if ((offset << 1) == 0x2a00)
+	{
 		m_rtc[m_index_sel & 0x3f] = data & 0xff;
+		// register B bit 6, MC146818-style: periodic interrupt enable.
+		// The 1986 POST turns it on with register A = 0x23 (122us rate)
+		// and demands its keyboard/RTC ISR on vector 0x25 count between
+		// 8 and 12 interrupts across a software delay loop. It enables
+		// FIRST and programs the rate AFTER, so writes to either
+		// register retune the timer.
+		if (((m_index_sel & 0x3f) == 0x0b || (m_index_sel & 0x3f) == 0x0a)
+				&& !machine().side_effects_disabled())
+		{
+			if (m_rtc[0x0b] & 0x40)
+			{
+				// rate 3 is 122us on a real MC146818. The POST demands
+				// 8-12 ticks across a counting window that measures
+				// ~930us as the emulated V30 executes it (the ISRs
+				// lengthen the delay loop): 122us lands 7.6 ticks - one
+				// short - and 61us lands 14, two over. Calibrated like
+				// the PIT clocks; 100us puts 9 in the window.
+				attotime const period = attotime::from_usec(88);
+				m_rtc_timer->adjust(period, 0, period);
+			}
+			else
+				m_rtc_timer->adjust(attotime::never);
+		}
+	}
 
 	// Keyboard microcontroller, as driven by the diagnostic utility:
 	// 0x2c1e takes a command byte (0x2c10 gates it), 0x2a08 is the
@@ -588,8 +662,6 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	if ((offset << 1) == 0x2c1e)
 	{
 		m_kb_reply = 0xfa;
-		if (!m_kb_timer)
-			m_kb_timer = timer_alloc(FUNC(wltc_state::kb_reply_cb), this);
 		m_kb_timer->adjust(attotime::from_usec(200));
 		logerror("kb cmd %02x -> reply irq scheduled\n", data & 0xff);
 	}
@@ -1027,6 +1099,14 @@ void wltc_state::wltc(machine_config &config)
 	m_maincpu->set_addrmap(AS_IO, &wltc_state::io_map);
 	m_maincpu->set_irq_acknowledge_callback(FUNC(wltc_state::irq_ack));
 
+	// The POST counts gate-array interrupts across software delay loops
+	// a few hundred microseconds long; with the default scheduling
+	// quantum the CPU runs far ahead of the timers, the interrupts all
+	// land after the loop has finished counting, and the tests fail.
+	// Keep the CPU and the timers interleaved tighter than the shortest
+	// counting window.
+	config.set_maximum_quantum(attotime::from_usec(25));
+
 	// NEC D71054, an 8254 clone, at 0x2400-0x2406 (one register every
 	// other address); the counters are clocked from the CPU crystal
 	// through the usual divider chain.
@@ -1065,8 +1145,8 @@ void wltc_state::wltc(machine_config &config)
 	// hardware (vectors 0x20/0x21, enabled by bits 0/1 of port 0x2202);
 	// deliver their OUT edges straight to the CPU INT line there - the
 	// 8259 is never initialised by that firmware
-	m_pit->out_handler<1>().set(FUNC(wltc_state::pit_out_w));
-	m_pit->out_handler<2>().set(FUNC(wltc_state::pit_out_w));
+	m_pit->out_handler<1>().set(FUNC(wltc_state::pit_out_w<1>));
+	m_pit->out_handler<2>().set(FUNC(wltc_state::pit_out_w<2>));
 
 	PIC8259(config, m_pic);
 	// through a gate: the unprogrammed 8259 answers every IR update
