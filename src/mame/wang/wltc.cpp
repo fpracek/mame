@@ -36,6 +36,7 @@
 
 #include "emu.h"
 #include "cpu/nec/nec.h"
+#include "machine/am9517a.h"
 #include "machine/pit8253.h"
 #include "machine/timer.h"
 #include "screen.h"
@@ -50,6 +51,7 @@ public:
 		driver_device(mconfig, type, tag),
 		m_maincpu(*this, "maincpu"),
 		m_pit(*this, "pit"),
+		m_dmac(*this, "dmac"),
 		m_shadow(*this, "shadow"),
 		m_lowram(*this, "lowram"),
 		m_fram(*this, "fram")
@@ -63,6 +65,7 @@ protected:
 private:
 	required_device<v30_device> m_maincpu;
 	required_device<pit8254_device> m_pit;
+	required_device<am9517a_device> m_dmac;
 	required_shared_ptr<uint16_t> m_shadow;
 	required_shared_ptr<uint16_t> m_lowram;
 	required_shared_ptr<uint16_t> m_fram;
@@ -190,6 +193,15 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
 		return m_pit->read((offset >> 1) & 3);
 
+	// DMA controller at 0x2300-0x230f, byte addressed (registers run
+	// consecutively, odd addresses included - the diagnostic uses 0x230a
+	// as the single mask register and 0x230f as the all-mask one).
+	if ((offset << 1) >= 0x2300 && (offset << 1) <= 0x230f)
+	{
+		int const reg = (offset << 1) - 0x2300 + ((mem_mask & 0x00ff) ? 0 : 1);
+		return m_dmac->read(reg & 0x0f);
+	}
+
 	// Reads of the boot overlay switch to the underlying RAM at the
 	// port 0x200 read inside the relocation walk: all ROM-sourced
 	// pipeline reads are done by then.
@@ -237,6 +249,16 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
 	{
 		m_pit->write((offset >> 1) & 3, data & 0xff);
+		return;
+	}
+
+	if ((offset << 1) >= 0x2300 && (offset << 1) <= 0x230f)
+	{
+		int const reg = (offset << 1) - 0x2300;
+		if (ACCESSING_BITS_0_7)
+			m_dmac->write(reg & 0x0f, data & 0xff);
+		if (ACCESSING_BITS_8_15)
+			m_dmac->write((reg + 1) & 0x0f, (data >> 8) & 0xff);
 		return;
 	}
 
@@ -438,6 +460,16 @@ void wltc_state::wltc(machine_config &config)
 	// NEC D71054, an 8254 clone, at 0x2400-0x2406 (one register every
 	// other address); the counters are clocked from the CPU crystal
 	// through the usual divider chain.
+	// 8237-compatible DMA controller at 0x2300-0x230f (byte addressed):
+	// the diagnostic programs channel addresses and counts there and
+	// masks channels through registers 0x0a and 0x0f before starting a
+	// transfer on the device at 0x2500.
+	AM9517A(config, m_dmac, 8_MHz_XTAL / 2);
+	m_dmac->in_memr_callback().set([this](offs_t offset) {
+		return m_maincpu->space(AS_PROGRAM).read_byte(offset); });
+	m_dmac->out_memw_callback().set([this](offs_t offset, uint8_t data) {
+		m_maincpu->space(AS_PROGRAM).write_byte(offset, data); });
+
 	PIT8254(config, m_pit);
 	m_pit->set_clk<0>(8_MHz_XTAL / 4);
 	m_pit->set_clk<1>(8_MHz_XTAL / 4);
