@@ -119,6 +119,10 @@ private:
 	uint8_t m_rtc[0x40];
 	uint16_t m_unmapped_value = 0xffff;
 	uint8_t m_vram_bank[2] = { 0, 0 };
+	// video memory behind the 8K window at 0xf2000: sixteen banks, of
+	// which the first two hold the 640x200 frame (640/8 * 200 = 16000
+	// bytes, just under two banks)
+	std::unique_ptr<uint8_t[]> m_vram;
 	// Boot-time tick as NMI: the whole boot runs with IF clear (no sti
 	// executed until the E0084 path), yet the hlt/inc-cw delay loops
 	// must advance - only NMI wakes a halted V30 with interrupts off,
@@ -155,28 +159,20 @@ private:
 
 uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
 {
-	// 80x25 text from the CGA-style buffer at 0xb8000, rendered with
-	// the 8x16 font found in the EPROMs (char 0 glyph at MYE800+0x75d1),
-	// LCD yellow-green like the real display
+	// The LCD has no hardware text mode: the BIOS rasterises glyphs
+	// into video memory itself (the diagnostic utility draws character
+	// by character, advancing by a frame buffer row pitch), so the
+	// screen is a plain 640x200 one-bit-per-pixel bitmap living in the
+	// banked memory behind the window at 0xf2000. Yellow-green on dark,
+	// like the real display.
 	const rgb_t fg(0x30, 0x38, 0x20), bg(0xc8, 0xd4, 0x40);
-	auto const *text = reinterpret_cast<const uint8_t *>(m_lowram.target());  // unused fallback
-	auto const *tram = reinterpret_cast<const uint8_t *>(memshare("textram")->ptr());
-	auto const *font = memregion("bios")->base() + 0x8000 + 0x75d1;
-	(void)text;
 	for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
 	{
-		int const row = y >> 4, line = y & 15;
 		uint32_t *dst = &bitmap.pix(y, cliprect.left());
 		for (int x = cliprect.left(); x <= cliprect.right(); x++)
 		{
-			int const col = x >> 3;
-			uint8_t const chr = tram[(row * 80 + col) * 2];
-			uint8_t const attr = tram[(row * 80 + col) * 2 + 1];
-			uint8_t const bits = font[chr * 16 + line];
-			bool on = BIT(bits, 7 - (x & 7));
-			if (attr & 0x70)  // crude reverse video
-				on = !on;
-			*dst++ = on ? fg : bg;
+			uint8_t const b = m_vram[(y * 80) + (x >> 3)];
+			*dst++ = BIT(b, 7 - (x & 7)) ? fg : bg;
 		}
 	}
 	return 0;
@@ -184,17 +180,30 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 
 uint16_t wltc_state::fseg_r(offs_t offset, uint16_t mem_mask)
 {
-	// the VRAM window at 0xf2000-0xf2fff reads back what was written
-	// (the POST video RAM test depends on it); everything else in the
-	// F segment reads the EPROM (verified live at F000:30E2)
-	if (offset >= 0x1000 && offset < 0x1800)
-		return m_fram[offset];
+	// The video memory window at 0xf2000-0xf3fff reads back what was
+	// written, through the bank selected by the display control
+	// register (the POST video RAM test depends on the readback);
+	// everything else in the F segment reads the EPROM, as a running
+	// machine does (verified live at F000:30E2).
+	if (offset >= 0x1000 && offset < 0x2000)
+	{
+		uint32_t const base = (m_vram_bank[0] << 13) | ((offset - 0x1000) << 1);
+		return m_vram[base] | (m_vram[base + 1] << 8);
+	}
 	return reinterpret_cast<const uint16_t *>(memregion("bios")->base() + 0x10000)[offset];
 }
 
 void wltc_state::fseg_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
 	COMBINE_DATA(&m_fram[offset]);
+	if (offset >= 0x1000 && offset < 0x2000)
+	{
+		uint32_t const base = (m_vram_bank[0] << 13) | ((offset - 0x1000) << 1);
+		if (ACCESSING_BITS_0_7)
+			m_vram[base] = data & 0xff;
+		if (ACCESSING_BITS_8_15)
+			m_vram[base + 1] = (data >> 8) & 0xff;
+	}
 	if (!m_fseg_logged[offset])
 	{
 		m_fseg_logged[offset] = 1;
@@ -410,6 +419,9 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 void wltc_state::machine_reset()
 {
 	m_fseg_logged.assign(0x8000, 0);
+	if (!m_vram)
+		m_vram = std::make_unique<uint8_t[]>(0x20000);
+	std::fill_n(&m_vram[0], 0x20000, 0);
 
 	// Power-on contents of the clock/scratch registers. The date and
 	// time fields are range-checked by the POST (month 1-12 at 0x10,
@@ -599,9 +611,11 @@ void wltc_state::wltc(machine_config &config)
 	TIMER(config, "tick").configure_periodic(FUNC(wltc_state::tick), attotime::from_hz(1000));
 
 	screen_device &screen(SCREEN(config, "screen", SCREEN_TYPE_LCD));
+	// 640x200 (the Wang graphics mode from the maintenance manual);
+	// the panel is 9.5 inches wide, so the pixels are far from square
 	screen.set_refresh_hz(60);
-	screen.set_size(640, 400);
-	screen.set_visarea(0, 639, 0, 399);
+	screen.set_size(640, 200);
+	screen.set_visarea(0, 639, 0, 199);
 	screen.set_screen_update(FUNC(wltc_state::screen_update));
 }
 
