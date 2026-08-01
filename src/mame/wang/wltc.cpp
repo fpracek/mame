@@ -103,6 +103,11 @@ private:
 	TIMER_DEVICE_CALLBACK_MEMBER(tick) { m_maincpu->pulse_input_line(INPUT_LINE_NMI, attotime::zero); }
 	TIMER_CALLBACK_MEMBER(kb_reply_cb)
 	{
+		// The event ISR at E000:9BD2 dispatches on the event code in AL
+		// (and si,0xff / cmp 0xf / call cs:[si*2+0x2a32]); event 6 is
+		// the keyboard handler at E98AB. Deliver the code in AL with
+		// the interrupt, the way the gate array does on real hardware.
+		m_maincpu->set_state_int(NEC_AW, (m_maincpu->state_int(NEC_AW) & 0xff00) | 0x06);
 		m_irq_vector = 0x81;
 		m_maincpu->set_input_line(0, HOLD_LINE);
 	}
