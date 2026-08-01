@@ -238,6 +238,12 @@ void wltc_state::machine_reset()
 	// live machine shows): phase A = function 0x10 programs the gate
 	// array and hits port 0x2b1e, which resets the CPU with the vector
 	// swapped to the phase-B hardware init entry E000:0019.
+	// Every unspecialized vector points at the plain iret at E000:0384
+	// (measured on real hardware: vector 0x63 - the target of the BRKN
+	// trap hidden at F30E2 - holds exactly that), so stray traps bounce
+	// instead of falling into zeroed memory.
+	for (int i = 0; i < 256; i++)
+		m_maincpu->space(AS_PROGRAM).write_dword(i * 4, 0xe0000384);
 	static const uint32_t ivt_seed[16] = {
 		0xe00000f1, 0xe0000148, 0xe0000177, 0xe00001d0,  // 80-83: IRQ0-3
 		0xe000020d, 0xe0000263, 0xe00002b8, 0xe00002e3,  // 84-87: IRQ4-7
