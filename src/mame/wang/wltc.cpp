@@ -431,8 +431,22 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	if ((offset << 1) == 0x2b1e && (data & 1))
 	{
 		logerror("cpu reset via 2b1e, INT88 vector -> phase B init\n");
-		// vector 0x88 lives in the ROM-backed window: patch the backing
-		// buffer directly
+
+		// Tried and rejected: entering phase B as int 88h function 0x12
+		// rather than by pointing the vector into the cold start. The
+		// dispatcher gives 0x12 a preamble of its own - mov ds,cs:[2] /
+		// mov sp,0x260 / mov ss,cs:[2], then the shared mov bp,sp at
+		// E0677 - and driving the machine in through it does deliver
+		// exactly the state the POST is missing: DS and SS come out E35F
+		// and the console flag at [0980] finally reads 0xff. But
+		// function 0x12 is not phase B. It lands at E0C3E, tests the
+		// phase flag [0A50], restarts once through E147F, and on the
+		// second pass runs a hundred-instruction routine at E0C48 and
+		// returns with reti. The whole machine stops after 239
+		// instructions. The full POST - video test, calibration,
+		// printer - only runs when the vector points at the cold start,
+		// so that entry is right and the data segment has to arrive some
+		// other way.
 		const int off = 0x88 * 4;
 		m_ivt_seed_rom[off] = 0x19; m_ivt_seed_rom[off + 1] = 0x00;
 		m_ivt_seed_rom[off + 2] = 0x00; m_ivt_seed_rom[off + 3] = 0xe0;
@@ -561,7 +575,8 @@ void wltc_state::machine_reset()
 	// question.
 	{
 		uint8_t *const shadow = reinterpret_cast<uint8_t *>(m_shadow.target());
-		if (shadow[0x80] == 0x00 && shadow[0x81] == 0x00
+		if (!(ioport("CONFIG")->read() & 0x0002)
+				&& shadow[0x80] == 0x00 && shadow[0x81] == 0x00
 				&& shadow[0x82] == 0xc2 && shadow[0x83] == 0xe4)
 		{
 			shadow[0x4c20] = 0xe8;  // call near
@@ -668,6 +683,15 @@ static INPUT_PORTS_START( wltc )
 	PORT_CONFNAME( 0xffff, 0xffff, "Undecoded port reads" )
 	PORT_CONFSETTING(      0xffff, "0xffff (pulled up)" )
 	PORT_CONFSETTING(      0x0000, "0x0000 (pulled down)" )
+
+	// experiment switch: whether to install the stub at E4C2:0000 that
+	// skips the init table and enters the code at 0x63, or to let the
+	// far call from E007F run the table as instructions the way the ROM
+	// image has it
+	PORT_START("CONFIG")
+	PORT_CONFNAME( 0x0002, 0x0000, "Init entry at E4C2:0000" )
+	PORT_CONFSETTING(      0x0000, "stub to 0x63" )
+	PORT_CONFSETTING(      0x0002, "run the table as code" )
 INPUT_PORTS_END
 
 
