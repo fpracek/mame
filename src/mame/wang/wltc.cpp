@@ -587,16 +587,50 @@ void wltc_state::machine_reset()
 	// so in this flow it fills from a garbage segment and scatters its
 	// writes across low memory. Entry state, again, not a missing
 	// device.
+	//
+	// Where the glyphs are meant to live is now known: the init picks
+	// BX = 0x0700 or 0x2000 at E4D6A/E4D72 depending on bit 6 of the
+	// descriptor, and E5751 reads the same 0x0700 back out of the code
+	// with mov es,cs:[0x14b]. So the character generator is read from
+	// RAM at 0x07000 (or 0x20000), not from the EPROM - something has to
+	// put the font there first, and nothing in this flow does. That is
+	// why the panel fills with structure rather than glyphs.
+	//
+	// A third shape, selectable with the config switch, enters the same
+	// body with CS=E35F through a trampoline. Worth trying because the
+	// module addresses its parameters CS-relative at offsets 0x13b-0x152
+	// and E4C2:0000 is the same linear address as E35F:1630, which is
+	// exactly where the BIOS data area ends. It derails, and the reason
+	// is the more useful answer: with CS=E4C2 those offsets fall at
+	// E4D5B-E4D72, inside the routine's own tail, so the cells are
+	// instruction bytes and variables at once. The init stores the
+	// display index and data ports into the immediates of its own code,
+	// and E5959 reads one straight back with mov dx,cs:[0x13f] / out
+	// dx,al. E4C2 is the right segment after all.
 	{
 		uint8_t *const shadow = reinterpret_cast<uint8_t *>(m_shadow.target());
-		if (!(ioport("CONFIG")->read() & 0x0002)
-				&& shadow[0x80] == 0x00 && shadow[0x81] == 0x00
+		uint16_t const cfg = ioport("CONFIG")->read();
+		if (shadow[0x80] == 0x00 && shadow[0x81] == 0x00
 				&& shadow[0x82] == 0xc2 && shadow[0x83] == 0xe4)
 		{
-			shadow[0x4c20] = 0xe8;  // call near
-			shadow[0x4c21] = 0x60;  // 0x0003 + 0x0060 = 0x0063
-			shadow[0x4c22] = 0x00;
-			shadow[0x4c23] = 0xcb;  // retf
+			if (cfg & 0x0004)
+			{
+				// E4C2:0000 -> jmp far E35F:1640
+				shadow[0x4c20] = 0xea;
+				shadow[0x4c21] = 0x40; shadow[0x4c22] = 0x16;
+				shadow[0x4c23] = 0x5f; shadow[0x4c24] = 0xe3;
+				// E35F:1640 (= 0xe4c30): call 0x1693, then retf
+				shadow[0x4c30] = 0xe8;
+				shadow[0x4c31] = 0x50; shadow[0x4c32] = 0x00;
+				shadow[0x4c33] = 0xcb;
+			}
+			else if (!(cfg & 0x0002))
+			{
+				shadow[0x4c20] = 0xe8;  // call near
+				shadow[0x4c21] = 0x60;  // 0x0003 + 0x0060 = 0x0063
+				shadow[0x4c22] = 0x00;
+				shadow[0x4c23] = 0xcb;  // retf
+			}
 		}
 	}
 
@@ -703,9 +737,10 @@ static INPUT_PORTS_START( wltc )
 	// far call from E007F run the table as instructions the way the ROM
 	// image has it
 	PORT_START("CONFIG")
-	PORT_CONFNAME( 0x0002, 0x0000, "Init entry at E4C2:0000" )
+	PORT_CONFNAME( 0x0006, 0x0000, "Init entry at E4C2:0000" )
 	PORT_CONFSETTING(      0x0000, "stub to 0x63" )
 	PORT_CONFSETTING(      0x0002, "run the table as code" )
+	PORT_CONFSETTING(      0x0004, "enter the body with CS=E35F" )
 INPUT_PORTS_END
 
 
