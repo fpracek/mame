@@ -61,6 +61,7 @@ public:
 		m_uart(*this, "uart"),
 		m_scc(*this, "scc"),
 		m_scsi(*this, "scsi5380"),
+		m_screen(*this, "screen"),
 		m_shadow(*this, "shadow"),
 		m_lowram(*this, "lowram"),
 		m_fram(*this, "fram")
@@ -79,6 +80,7 @@ private:
 	required_device<ins8250_device> m_uart;
 	required_device<scc8530_device> m_scc;
 	required_device<ncr5380_device> m_scsi;
+	required_device<screen_device> m_screen;
 	required_shared_ptr<uint16_t> m_shadow;
 	required_shared_ptr<uint16_t> m_lowram;
 	required_shared_ptr<uint16_t> m_fram;
@@ -247,6 +249,28 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	{
 		int const reg = (offset << 1) - 0x3f8 + ((mem_mask & 0x00ff) ? 0 : 1);
 		return m_uart->ins8250_r(reg & 7);
+	}
+
+	// CGA/MDA display status register at the industry-standard addresses
+	// 0x3da and 0x3ba. The POST calibrates against it at E12A7: with
+	// interrupts off it counts down CX across one 0-to-1 and one 1-to-0
+	// transition of bit 0, then demands that CH still reads 0xff, i.e.
+	// that both edges arrived inside 256 iterations of a three
+	// instruction loop. It retries five times and, when every attempt
+	// overruns, calls int 0x88 function 0x0d - the service that restarts
+	// the hardware init - and halts on the jmp at E12CF. So the machine
+	// cannot get past video setup unless this bit really toggles with the
+	// raster. Bit 0 is display enable (set while blanked), bit 3 is
+	// vertical retrace, as on a CGA.
+	if ((offset << 1) == 0x3da || (offset << 1) == 0x3ba)
+	{
+		uint8_t status = 0;
+		bool const vblank = m_screen->vblank();
+		if (vblank || m_screen->hblank())
+			status |= 0x01;
+		if (vblank)
+			status |= 0x08;
+		return status;
 	}
 
 	// D71059 interrupt controller (8259 clone), reachable at the
@@ -463,6 +487,19 @@ void wltc_state::machine_reset()
 	// stays RAM for the manufactured interrupt frames at 0000:FFEx.
 	// Reads switch to the underlying RAM at the port 0x200 read inside
 	// the relocation walk (see io_r).
+	//
+	// The overlay is scaffolding, not a hardware model, and the POST now
+	// runs far enough to show it. Phase A - everything between the reset
+	// vector and the port 0x2b1e CPU reset - is 84 instructions long and
+	// copies nothing, so on real hardware low memory during phase B is
+	// whatever the gate array leaves there. It is not the EPROM: the
+	// message dispatcher at E1280 reads a device-table pointer from
+	// 0040:00AF, and neither aliasing model produces a usable table
+	// (offset-mirrored gives SI=0x000E with a count of 0xADEA, a 1:1
+	// alias gives SI=0xAAEC with a count of 0xC7F6). Something builds
+	// those tables before the BIOS runs, and finding it is what stands
+	// between the POST and its first printed line - see the wait at
+	// E14A6 below.
 	m_maincpu->space(AS_PROGRAM).install_rom(0x00400, 0x0f7ff, memregion("bios")->base());
 	m_maincpu->space(AS_PROGRAM).install_writeonly(0x00400, 0x0f7ff,
 			reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x400);
@@ -487,12 +524,21 @@ void wltc_state::machine_reset()
 	// returns to E000:0084 - every original instruction correct, no
 	// patching of the ROM. What writes the stub on real hardware is
 	// still unknown; installing it here stands in for that.
+	//
+	// The 4.00 image recovered from the system diskette (BIOS.SYS) calls
+	// E4B0:0000 instead and holds an ordinary routine prologue there, so
+	// it needs no stub: the workaround is specific to the 4.02.03 EPROM
+	// layout and is keyed off that image's far-call operand.
 	{
 		uint8_t *const shadow = reinterpret_cast<uint8_t *>(m_shadow.target());
-		shadow[0x4c20] = 0xe8;  // call near
-		shadow[0x4c21] = 0x60;  // 0x0003 + 0x0060 = 0x0063
-		shadow[0x4c22] = 0x00;
-		shadow[0x4c23] = 0xcb;  // retf
+		if (shadow[0x80] == 0x00 && shadow[0x81] == 0x00
+				&& shadow[0x82] == 0xc2 && shadow[0x83] == 0xe4)
+		{
+			shadow[0x4c20] = 0xe8;  // call near
+			shadow[0x4c21] = 0x60;  // 0x0003 + 0x0060 = 0x0063
+			shadow[0x4c22] = 0x00;
+			shadow[0x4c23] = 0xcb;  // retf
+		}
 	}
 
 	// The bytes at E4C2:0000-0062 are data, not code: executing them
@@ -647,10 +693,13 @@ void wltc_state::wltc(machine_config &config)
 
 	screen_device &screen(SCREEN(config, "screen", SCREEN_TYPE_LCD));
 	// 640x200 (the Wang graphics mode from the maintenance manual);
-	// the panel is 9.5 inches wide, so the pixels are far from square
-	screen.set_refresh_hz(60);
-	screen.set_size(640, 200);
-	screen.set_visarea(0, 639, 0, 199);
+	// the panel is 9.5 inches wide, so the pixels are far from square.
+	// Raw timings rather than a bare refresh rate: the POST calibrates
+	// against the blanking intervals through the status register at
+	// 0x3da, so the horizontal and vertical blanking periods have to
+	// exist. CGA-like totals at 60 Hz put a scanline at 63.6us, which
+	// the calibration loop at E12A7 samples roughly every 4us.
+	screen.set_raw(12'576'000, 800, 0, 640, 262, 0, 200);
 	screen.set_screen_update(FUNC(wltc_state::screen_update));
 }
 
@@ -664,6 +713,16 @@ ROM_START( wltc )
 	ROMX_LOAD( "myf000.bin", 0x10000, 0x8000, CRC(b0d23b9d) SHA1(c068b6c897b2ffea222ff7a38d3f39ac6fba54a4), ROM_BIOS(0) )
 	ROMX_LOAD( "myf800.bin", 0x18000, 0x8000, CRC(0d458043) SHA1(5019b085fa245dd3461d8d8811d40064875b605b), ROM_BIOS(0) )
 	// earlier revision (1985/1986 copyright), 64K at 0xf0000, even/odd EPROM pair
+	// BIOS 4.00 as shipped on the system diskette: the file is a shadow
+	// image for segment E000 (cold start at 0x18, far call operand E4B0),
+	// recovered with scantool/estrai_fat.py. It is 0x9061 bytes, so the
+	// tail is filled from the 4.02.03 EPROMs.
+	ROM_SYSTEM_BIOS( 2, "v400", "BIOS 4.00 (BIOS.SYS)" )
+	ROMX_LOAD( "biossys400_a.bin", 0x00000, 0x8000, CRC(ddf4569f) SHA1(75b3cf71cbe7ff840b18ce0dbb04412550f4d79f), ROM_BIOS(2) )
+	ROMX_LOAD( "biossys400_b.bin", 0x08000, 0x8000, CRC(7538a123) SHA1(ae92cd372dafc8b0aa90d8aa32e483544c0576ea), ROM_BIOS(2) )
+	ROMX_LOAD( "myf000.bin", 0x10000, 0x8000, CRC(b0d23b9d) SHA1(c068b6c897b2ffea222ff7a38d3f39ac6fba54a4), ROM_BIOS(2) )
+	ROMX_LOAD( "myf800.bin", 0x18000, 0x8000, CRC(0d458043) SHA1(5019b085fa245dd3461d8d8811d40064875b605b), ROM_BIOS(2) )
+
 	ROM_SYSTEM_BIOS( 1, "v1986", "1986 BIOS" )
 	ROMX_LOAD( "mainboard_a.bin", 0x10000, 0x8000, CRC(2ac9a03c) SHA1(29b5a0d5343f770628ed0089a2b8a87d518bb251), ROM_BIOS(1) | ROM_SKIP(1) )
 	ROMX_LOAD( "mainboard_b.bin", 0x10001, 0x8000, CRC(f38aec77) SHA1(926b947a7411a2bfa6394b6b9dfd5118bcb27228), ROM_BIOS(1) | ROM_SKIP(1) )
