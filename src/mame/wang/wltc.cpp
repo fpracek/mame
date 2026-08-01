@@ -501,6 +501,17 @@ void wltc_state::machine_reset()
 		m_vram = std::make_unique<uint8_t[]>(0x20000);
 	std::fill_n(&m_vram[0], 0x20000, 0);
 
+	// The F EPROM carries the glyph cache pre-expanded behind the video
+	// window: 0x2000-0x3fff holds exactly 256 characters at 32 bytes
+	// each - the 8x16 font with every row doubled, the LCD's native
+	// glyph format - which is precisely the window's 8K. On hardware
+	// the window reads the EPROM until something writes over it, so the
+	// character generator is simply there at power-on; the emulated
+	// window read back RAM, which is why the POST rasterised its banner
+	// with blank glyphs. Seed the first two banks with the EPROM
+	// content.
+	memcpy(&m_vram[0], memregion("bios")->base() + 0x10000 + 0x2000, 0x2000);
+
 	// Power-on contents of the clock/scratch registers. The date and
 	// time fields are range-checked by the POST (month 1-12 at 0x10,
 	// hour 0-23 at 0x13, second 0-99 at 0x12); the values at 0x30-0x33
