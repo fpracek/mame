@@ -97,6 +97,8 @@ private:
 	uint8_t m_irq_vector = 0x80;
 	uint8_t m_kb_reply = 0;
 	uint8_t m_index_sel = 0xff;
+	uint8_t m_rtc[0x40];
+	uint16_t m_unmapped_value = 0xffff;
 	// Boot-time tick as NMI: the whole boot runs with IF clear (no sti
 	// executed until the E0084 path), yet the hlt/inc-cw delay loops
 	// must advance - only NMI wakes a halted V30 with interrupts off,
@@ -199,23 +201,13 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	                            // (experiment: report clear; reads 0xff at DOS time)
 	case 0x2a00:
 		// Index/data device on 0x2c00 (index) / 0x2a00 (data): the gate
-		// array real-time clock. The POST range-checks the fields it
-		// reads back (month 1-12 at index 0x10, hour 0-23 at 0x13,
-		// second 0-99 at 0x12) and beeps and halts if any is out of
-		// range, so return a plausible date and time.
-		switch (m_index_sel)
-		{
-		case 0x0a: // status: the POST waits for bit 7 to pulse
+		// array clock and its battery-backed scratch registers. Index
+		// 0x0a is a status register whose bit 7 the POST waits to
+		// pulse; everything else reads back what was written, over the
+		// power-on contents in m_rtc.
+		if (m_index_sel == 0x0a)
 			return (machine().time().as_ticks(120) & 1) ? 0x80 : 0x00;
-		case 0x10: return 0x01;  // month  (1-12 checked)
-		case 0x11: return 0x01;  // day    (1-31 checked)
-		case 0x12: return 0x00;  // second (0-99 checked)
-		case 0x13: return 0x00;  // hour   (0-23 checked)
-		case 0x14: return 0x00;  // minute (0-59 checked)
-		case 0x15: return 0x00;
-		case 0x0e: return 0x00;  // boot counter, incremented by the POST
-		}
-		return m_index_sel;
+		return m_rtc[m_index_sel & 0x3f];
 	case 0x2a08: return 0x0044; // handshake status, bit7 = busy, measured idle
 	case 0x2b02: return 0x00fe; // measured 0xfc idle; bit1 (ready to accept) forced high
 	case 0x2e1e: return 0x00f4; // mode/config register, measured on real hardware:
@@ -225,16 +217,18 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	}
 	// reads of 0x2a00 must NOT return the 0xdb probe signature: the
 	// optional device is absent on the reference machine too
-	return 0xffff;
+	return m_unmapped_value;
 }
 
 void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
 	logerror("%06x: io_w %04x = %04x mask %04x\n", m_maincpu->pc(), offset << 1, data, mem_mask);
 
-	// index register of the index/data device polled through 0x2a00
+	// index register of the clock/scratch device, and its data port
 	if ((offset << 1) == 0x2c00)
 		m_index_sel = data & 0xff;
+	if ((offset << 1) == 0x2a00)
+		m_rtc[m_index_sel & 0x3f] = data & 0xff;
 
 	// A command byte written to the keyboard microcontroller data port
 	// 0x2c1e gets a reply interrupt (IRQ1 -> INT 81h) shortly after:
@@ -271,6 +265,19 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 void wltc_state::machine_reset()
 {
 	m_fseg_logged.assign(0x8000, 0);
+
+	// Power-on contents of the clock/scratch registers. The date and
+	// time fields are range-checked by the POST (month 1-12 at 0x10,
+	// hour 0-23 at 0x13, second 0-99 at 0x12); the values at 0x30-0x33
+	// are the ones a running machine returns (measured with DEBUG).
+	std::fill(std::begin(m_rtc), std::end(m_rtc), 0);
+	m_rtc[0x10] = 0x01;  // month
+	m_rtc[0x11] = 0x01;  // day
+	m_unmapped_value = ioport("UNMAPPED")->read();
+	m_rtc[0x30] = 0xbc;
+	m_rtc[0x31] = 0xfb;
+	m_rtc[0x32] = 0xad;
+	m_rtc[0x33] = 0x2f;
 
 	// The 1986 BIOS revision is a plain 64K image at 0xf0000 whose reset
 	// vector is an ordinary far jump (ea aa 00 00 fc = jmp FC00:00AA),
@@ -380,6 +387,15 @@ void wltc_state::io_map(address_map &map)
 
 
 static INPUT_PORTS_START( wltc )
+	// experiment switch: what an undecoded port read returns. The 1986
+	// BIOS picks its boot mode from configuration bits (bit 13 of the
+	// word at 0x2b0a), and the maintenance manual describes diagnostic
+	// jumpers selecting customer / repair-aid / burn-in modes, so the
+	// idle bus level can change which path a BIOS takes.
+	PORT_START("UNMAPPED")
+	PORT_CONFNAME( 0xffff, 0xffff, "Undecoded port reads" )
+	PORT_CONFSETTING(      0xffff, "0xffff (pulled up)" )
+	PORT_CONFSETTING(      0x0000, "0x0000 (pulled down)" )
 INPUT_PORTS_END
 
 
