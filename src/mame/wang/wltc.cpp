@@ -471,6 +471,18 @@ void wltc_state::machine_reset()
 			reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x10000);
 	m_boot_mirror = true;
 
+	// The bytes at E4C2:0000-0062 are data, not code: executing them
+	// leaves five words on the stack (a push of ES, three of CS and one
+	// of AX, with no matching pops - the rest of the boot balances
+	// perfectly), which is exactly what makes the init chain return
+	// into nowhere. The real code starts at E4C2:0063. Point the far
+	// call at E007F there, which on hardware presumably comes from the
+	// gate array supplying a different entry offset.
+	// (patch the ROM image itself: the cold start copies its first page
+	// back over the shadow from the boot mirror, so patching only the
+	// shadow would be undone)
+	memregion("bios")->base()[0x0080] = 0x63;
+
 	// The reset vector executes mov al,0x10 / int 0x88, so the gate
 	// array must seed the interrupt vector table at power-on. Use the
 	// vectors read from a running machine with DEBUG (D 0:200 L 40):
