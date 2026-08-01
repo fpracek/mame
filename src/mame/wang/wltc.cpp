@@ -64,7 +64,8 @@ public:
 		m_screen(*this, "screen"),
 		m_shadow(*this, "shadow"),
 		m_lowram(*this, "lowram"),
-		m_fram(*this, "fram")
+		m_fram(*this, "fram"),
+		m_textram(*this, "textram")
 	{ }
 
 	void wltc(machine_config &config);
@@ -84,6 +85,7 @@ private:
 	required_shared_ptr<uint16_t> m_shadow;
 	required_shared_ptr<uint16_t> m_lowram;
 	required_shared_ptr<uint16_t> m_fram;
+	required_shared_ptr<uint16_t> m_textram;
 	bool m_boot_mirror = false;
 	std::vector<uint8_t> m_fseg_logged;
 	uint8_t m_ivt_seed_rom[0x240];
@@ -116,6 +118,7 @@ private:
 	// microcontroller reply interrupt on IRQ1 shortly after each
 	// command byte written to port 0x2c1e.
 	uint8_t m_irq_vector = 0x80;
+	bool m_tick_int = false;
 	uint8_t m_kb_reply = 0;
 	uint8_t m_index_sel = 0xff;
 	uint8_t m_rtc[0x40];
@@ -134,7 +137,25 @@ private:
 	{
 		// the 1986 BIOS sets up its own vectors and timer: no scaffolding
 		if (!m_legacy_bios)
+		{
+			// NMI wakes the hlt/inc-cw delay loops that run with IF
+			// clear; once the POST turns interrupts on, the same tick
+			// must also arrive as IRQ0, because the timer handler at
+			// E00F1 is what pumps the console: it runs the device
+			// poller at E119E, which sends the next queued character
+			// out of port 0x2a08 through E0E65. Without it the printer
+			// enqueues both boot messages and nothing ever drains them.
 			m_maincpu->pulse_input_line(INPUT_LINE_NMI, attotime::zero);
+			// straight to the CPU INT line: the POST has not programmed
+			// the interrupt controller at this stage, so a request
+			// through the PIC never reaches the CPU. The acknowledge
+			// callback supplies the measured tick vector 0x80. Held off
+			// until the video calibration runs - the tick handler
+			// derails the early phases if it fires before the data
+			// structures it walks exist.
+			if (m_tick_int)
+				m_maincpu->set_input_line(0, HOLD_LINE);
+		}
 	}
 	TIMER_CALLBACK_MEMBER(kb_reply_cb)
 	{
@@ -152,22 +173,47 @@ private:
 	IRQ_CALLBACK_MEMBER(irq_ack)
 	{
 		// once the BIOS has programmed the controller its own vector
-		// wins; until then fall back to the measured tick vector
+		// wins; until then fall back to the measured tick vector (the
+		// unprogrammed 8259 returns junk below the 0x80 base)
 		uint8_t const v = m_pic->acknowledge();
-		return v ? v : 0x80;
+		return v >= 0x80 ? v : 0x80;
 	}
 };
 
 
 uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
 {
-	// The LCD has no hardware text mode: the BIOS rasterises glyphs
-	// into video memory itself (the diagnostic utility draws character
-	// by character, advancing by a frame buffer row pitch), so the
-	// screen is a plain 640x200 one-bit-per-pixel bitmap living in the
-	// banked memory behind the window at 0xf2000. Yellow-green on dark,
-	// like the real display.
 	const rgb_t fg(0x30, 0x38, 0x20), bg(0xc8, 0xd4, 0x40);
+
+	// The Wang-mode console composes text as character/attribute pairs
+	// in the buffer at 0xb8000 - the tick-driven console pump delivers
+	// the POST banner there - and the display micro renders it with the
+	// glyph cache. Model that: when the text buffer holds anything,
+	// render it as 80x25 cells of 8 scanlines, taking every other row
+	// of the EPROM's 8x16 font. An empty buffer falls back to the
+	// 640x200 bitmap in the banked memory behind the window at 0xf2000
+	// (the diagnostic and the video test draw pixels directly).
+	bool text = false;
+	for (int i = 0; i < 80 * 25 && !text; i++)
+		text = (m_textram[i] & 0xff) > 0x20 && (m_textram[i] & 0xff) < 0x7f;
+
+	if (text)
+	{
+		uint8_t const *const font = memregion("bios")->base() + 0xf5d1;
+		for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
+		{
+			int const row = y >> 3, line = y & 7;
+			uint32_t *dst = &bitmap.pix(y, cliprect.left());
+			for (int x = cliprect.left(); x <= cliprect.right(); x++)
+			{
+				uint8_t const ch = m_textram[(row * 80) + (x >> 3)] & 0xff;
+				uint8_t const bits = font[(ch << 4) + (line << 1) + 1];
+				*dst++ = BIT(bits, 7 - (x & 7)) ? fg : bg;
+			}
+		}
+		return 0;
+	}
+
 	for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
 	{
 		uint32_t *dst = &bitmap.pix(y, cliprect.left());
@@ -251,6 +297,14 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		return m_uart->ins8250_r(reg & 7);
 	}
 
+	// Console status, read by the timer-tick device poller at E11C5 as
+	// port (selector << 8) | 0x62 with the console's selector 0x10. The
+	// poller rotates bit 0 up to bit 7 and treats it as offline/busy:
+	// it has to read clear or the poller marks the console dead and
+	// flushes its queue instead of transmitting.
+	if ((offset << 1) == 0x1062)
+		return 0x0000;
+
 	// CGA/MDA display status register at the industry-standard addresses
 	// 0x3da and 0x3ba. The POST calibrates against it at E12A7: with
 	// interrupts off it counts down CX across one 0-to-1 and one 1-to-0
@@ -264,6 +318,12 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	// vertical retrace, as on a CGA.
 	if ((offset << 1) == 0x3da || (offset << 1) == 0x3ba)
 	{
+		// from here on the tick may arrive as a real interrupt: the
+		// structures the handler walks are in place once the video
+		// calibration runs
+		if (!machine().side_effects_disabled())
+			m_tick_int = true;
+
 		uint8_t status = 0;
 		bool const vblank = m_screen->vblank();
 		if (vblank || m_screen->hblank())
@@ -497,6 +557,7 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 void wltc_state::machine_reset()
 {
 	m_fseg_logged.assign(0x8000, 0);
+	m_tick_int = false;
 	if (!m_vram)
 		m_vram = std::make_unique<uint8_t[]>(0x20000);
 	std::fill_n(&m_vram[0], 0x20000, 0);
