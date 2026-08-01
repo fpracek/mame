@@ -96,11 +96,18 @@ private:
 	// command byte written to port 0x2c1e.
 	uint8_t m_irq_vector = 0x80;
 	uint8_t m_kb_reply = 0;
+	uint8_t m_index_sel = 0xff;
 	// Boot-time tick as NMI: the whole boot runs with IF clear (no sti
 	// executed until the E0084 path), yet the hlt/inc-cw delay loops
 	// must advance - only NMI wakes a halted V30 with interrupts off,
 	// and the seeded default vector 2 (plain iret) is exactly enough.
-	TIMER_DEVICE_CALLBACK_MEMBER(tick) { m_maincpu->pulse_input_line(INPUT_LINE_NMI, attotime::zero); }
+	bool m_legacy_bios = false;
+	TIMER_DEVICE_CALLBACK_MEMBER(tick)
+	{
+		// the 1986 BIOS sets up its own vectors and timer: no scaffolding
+		if (!m_legacy_bios)
+			m_maincpu->pulse_input_line(INPUT_LINE_NMI, attotime::zero);
+	}
 	TIMER_CALLBACK_MEMBER(kb_reply_cb)
 	{
 		// The event ISR at E000:9BD2 dispatches on the event code in AL
@@ -190,6 +197,11 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	case 0x204:  logerror("0204 stub hit\n");
 	             return 0x0000; // boot-time device status, bit0 tested after read
 	                            // (experiment: report clear; reads 0xff at DOS time)
+	case 0x2a00: // index/data device: the BIOS selects an index on 0x2c00
+	             // and polls the answer here. On real hardware indexes
+	             // 0x30/0x31 answer 0xdb; give a plain acknowledge for
+	             // the boot-time indexes so the POST poll completes.
+	             return m_index_sel;
 	case 0x2a08: return 0x0044; // handshake status, bit7 = busy, measured idle
 	case 0x2b02: return 0x00fe; // measured 0xfc idle; bit1 (ready to accept) forced high
 	case 0x2e1e: return 0x00f4; // mode/config register, measured on real hardware:
@@ -205,6 +217,10 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
 	logerror("%06x: io_w %04x = %04x mask %04x\n", m_maincpu->pc(), offset << 1, data, mem_mask);
+
+	// index register of the index/data device polled through 0x2a00
+	if ((offset << 1) == 0x2c00)
+		m_index_sel = data & 0xff;
 
 	// A command byte written to the keyboard microcontroller data port
 	// 0x2c1e gets a reply interrupt (IRQ1 -> INT 81h) shortly after:
@@ -240,12 +256,25 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 
 void wltc_state::machine_reset()
 {
+	m_fseg_logged.assign(0x8000, 0);
+
+	// The 1986 BIOS revision is a plain 64K image at 0xf0000 whose reset
+	// vector is an ordinary far jump (ea aa 00 00 fc = jmp FC00:00AA),
+	// not the int 0x88 convention: none of the gate-array scaffolding
+	// below (shadow RAM, boot mirror, seeded IVT) applies to it.
+	uint8_t const *const bios = memregion("bios")->base();
+	m_legacy_bios = (bios[0] == 0xff && bios[1] == 0xff);   // E half blank: 64K image
+	if (m_legacy_bios)
+	{
+		std::fill_n(&m_shadow[0], 0x8000, 0);
+		return;
+	}
+
 	// The BIOS runs the E segment from RAM shadowed over the EPROMs: the
 	// cold start patches its own dispatch stubs at 0xe0004+ and keeps
 	// data and stacks in segment E35F. Preload the shadow from the
 	// EPROMs; the F segment stays ROM for reads.
-	memcpy(m_shadow, memregion("bios")->base(), 0x10000);
-	m_fseg_logged.assign(0x8000, 0);
+	memcpy(m_shadow, bios, 0x10000);
 
 	// Boot overlay: reads come from the EPROM mirrored at 0x400, writes
 	// go through to the RAM underneath (the ES=0 clear that zeroes the
