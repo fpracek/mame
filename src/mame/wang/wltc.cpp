@@ -40,7 +40,9 @@
 #include "machine/ins8250.h"
 #include "machine/pic8259.h"
 #include "machine/pit8253.h"
+#include "machine/ncr5380.h"
 #include "machine/z80scc.h"
+#include "bus/nscsi/devices.h"
 #include "machine/timer.h"
 #include "screen.h"
 
@@ -58,6 +60,7 @@ public:
 		m_pic(*this, "pic"),
 		m_uart(*this, "uart"),
 		m_scc(*this, "scc"),
+		m_scsi(*this, "scsi5380"),
 		m_shadow(*this, "shadow"),
 		m_lowram(*this, "lowram"),
 		m_fram(*this, "fram")
@@ -75,6 +78,7 @@ private:
 	required_device<pic8259_device> m_pic;
 	required_device<ins8250_device> m_uart;
 	required_device<scc8530_device> m_scc;
+	required_device<ncr5380_device> m_scsi;
 	required_shared_ptr<uint16_t> m_shadow;
 	required_shared_ptr<uint16_t> m_lowram;
 	required_shared_ptr<uint16_t> m_fram;
@@ -211,6 +215,14 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
 		return m_pit->read((offset >> 1) & 3);
 
+	// NCR 53C80 SCSI controller at 0x2700-0x270e, one register every
+	// other address in the standard order (output data, initiator
+	// command, mode, target command, current bus status, bus and
+	// status, input data, reset parity). The internal Winchester and
+	// the external floppy drive both live on this bus.
+	if ((offset << 1) >= 0x2700 && (offset << 1) <= 0x270f)
+		return m_scsi->read((offset >> 1) & 7);
+
 	// Z8530 serial communications controller at 0x2500-0x2506, one
 	// register every other address in the classic B/A control/data
 	// order: the diagnostic initialises it with the textbook register
@@ -292,6 +304,12 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
 	{
 		m_pit->write((offset >> 1) & 3, data & 0xff);
+		return;
+	}
+
+	if ((offset << 1) >= 0x2700 && (offset << 1) <= 0x270f)
+	{
+		m_scsi->write((offset >> 1) & 7, data & 0xff);
 		return;
 	}
 
@@ -560,6 +578,15 @@ void wltc_state::wltc(machine_config &config)
 
 	PIC8259(config, m_pic);
 	m_pic->out_int_callback().set_inputline(m_maincpu, 0);
+
+	// NCR 53C80 SCSI bus at 0x2700: the JVC Winchester sits on it, and
+	// so does the external floppy drive
+	nscsi_bus_device &scsibus(NSCSI_BUS(config, "scsi"));
+	NSCSI_CONNECTOR(config, "scsi:0", default_scsi_devices, "harddisk");
+	NSCSI_CONNECTOR(config, "scsi:1", default_scsi_devices, nullptr);
+	NCR5380(config, m_scsi);
+	scsibus.set_external_device(7, m_scsi);
+	m_scsi->irq_handler().set(m_pic, FUNC(pic8259_device::ir5_w));
 
 	// Z8530APS serial communications controller at 0x2500
 	SCC8530(config, m_scc, 8_MHz_XTAL / 2);
