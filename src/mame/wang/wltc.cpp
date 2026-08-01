@@ -246,17 +246,26 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	if ((offset << 1) == 0x2a00)
 		m_rtc[m_index_sel & 0x3f] = data & 0xff;
 
-	// A command byte written to the keyboard microcontroller data port
-	// 0x2c1e gets a reply interrupt (IRQ1 -> INT 81h) shortly after:
-	// the reply byte is latched for whatever data port the ISR reads
-	// (reconnaissance: watch the io_r log after this fires).
+	// Keyboard microcontroller, as driven by the diagnostic utility:
+	// 0x2c1e takes a command byte (0x2c10 gates it), 0x2a08 is the
+	// status port that is read straight after a command and also takes
+	// the sound commands 0x0b (tone) and 0x0c (click). A command is
+	// answered with a reply interrupt on IRQ1 carrying event code 6.
 	if ((offset << 1) == 0x2c1e)
 	{
-		m_kb_reply = 0xfa;  // ack-style reply until the protocol is known
+		m_kb_reply = 0xfa;
 		if (!m_kb_timer)
 			m_kb_timer = timer_alloc(FUNC(wltc_state::kb_reply_cb), this);
 		m_kb_timer->adjust(attotime::from_usec(200));
 		logerror("kb cmd %02x -> reply irq scheduled\n", data & 0xff);
+	}
+	if ((offset << 1) == 0x2a08)
+	{
+		switch (data & 0xff)
+		{
+		case 0x0b: logerror("beeper: tone\n"); break;
+		case 0x0c: logerror("beeper: click\n"); break;
+		}
 	}
 
 	// Writing 1 to port 0x2b1e triggers a CPU reset and advances the
