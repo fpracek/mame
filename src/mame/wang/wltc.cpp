@@ -384,6 +384,10 @@ void wltc_state::mem_map(address_map &map)
 	// CGA-style text buffer: the character output service runs with
 	// DS=B800 and 80-column rows, attribute 0x07 - the standard IBM
 	// text segment, kept by the BIOS as the source for the LCD refresh
+	// The diagnostic utility tests a monochrome text buffer at 0xb0000
+	// as well as the colour one at 0xb8000 - the machine answers on
+	// both the MDA and CGA port sets on real hardware.
+	map(0xb0000, 0xb7fff).ram().share("monoram");
 	map(0xb8000, 0xbffff).ram().share("textram");
 	// debug window: mirror of everything the BIOS writes into the F
 	// segment (VRAM and video registers), readable from Lua for dumps
