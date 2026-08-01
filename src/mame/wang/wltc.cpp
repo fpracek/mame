@@ -96,7 +96,11 @@ private:
 	// command byte written to port 0x2c1e.
 	uint8_t m_irq_vector = 0x80;
 	uint8_t m_kb_reply = 0;
-	TIMER_DEVICE_CALLBACK_MEMBER(tick) { m_irq_vector = 0x80; m_maincpu->set_input_line(0, HOLD_LINE); }
+	// Boot-time tick as NMI: the whole boot runs with IF clear (no sti
+	// executed until the E0084 path), yet the hlt/inc-cw delay loops
+	// must advance - only NMI wakes a halted V30 with interrupts off,
+	// and the seeded default vector 2 (plain iret) is exactly enough.
+	TIMER_DEVICE_CALLBACK_MEMBER(tick) { m_maincpu->pulse_input_line(INPUT_LINE_NMI, attotime::zero); }
 	TIMER_CALLBACK_MEMBER(kb_reply_cb)
 	{
 		m_irq_vector = 0x81;
@@ -138,6 +142,11 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 
 uint16_t wltc_state::fseg_r(offs_t offset, uint16_t mem_mask)
 {
+	// the VRAM window at 0xf2000-0xf2fff reads back what was written
+	// (the POST video RAM test depends on it); everything else in the
+	// F segment reads the EPROM (verified live at F000:30E2)
+	if (offset >= 0x1000 && offset < 0x1800)
+		return m_fram[offset];
 	return reinterpret_cast<const uint16_t *>(memregion("bios")->base() + 0x10000)[offset];
 }
 
@@ -173,7 +182,8 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	// idle values measured on the real machine (LCD model) with DEBUG:
 	switch (offset << 1)
 	{
-	case 0x204:  return 0x0000; // boot-time device status, bit0 tested after read
+	case 0x204:  logerror("0204 stub hit\n");
+	             return 0x0000; // boot-time device status, bit0 tested after read
 	                            // (experiment: report clear; reads 0xff at DOS time)
 	case 0x2a08: return 0x0044; // handshake status, bit7 = busy, measured idle
 	case 0x2b02: return 0x00fe; // measured 0xfc idle; bit1 (ready to accept) forced high
