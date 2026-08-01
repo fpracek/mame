@@ -37,6 +37,7 @@
 #include "emu.h"
 #include "cpu/nec/nec.h"
 #include "machine/am9517a.h"
+#include "machine/pic8259.h"
 #include "machine/pit8253.h"
 #include "machine/timer.h"
 #include "screen.h"
@@ -52,6 +53,7 @@ public:
 		m_maincpu(*this, "maincpu"),
 		m_pit(*this, "pit"),
 		m_dmac(*this, "dmac"),
+		m_pic(*this, "pic"),
 		m_shadow(*this, "shadow"),
 		m_lowram(*this, "lowram"),
 		m_fram(*this, "fram")
@@ -66,6 +68,7 @@ private:
 	required_device<v30_device> m_maincpu;
 	required_device<pit8254_device> m_pit;
 	required_device<am9517a_device> m_dmac;
+	required_device<pic8259_device> m_pic;
 	required_shared_ptr<uint16_t> m_shadow;
 	required_shared_ptr<uint16_t> m_lowram;
 	required_shared_ptr<uint16_t> m_fram;
@@ -121,13 +124,21 @@ private:
 		// The event ISR at E000:9BD2 dispatches on the event code in AL
 		// (and si,0xff / cmp 0xf / call cs:[si*2+0x2a32]); event 6 is
 		// the keyboard handler at E98AB. Deliver the code in AL with
-		// the interrupt, the way the gate array does on real hardware.
+		// the interrupt, the way the gate array does on real hardware,
+		// and raise the request on the interrupt controller line the
+		// measured mask assigns to the keyboard.
 		m_maincpu->set_state_int(NEC_AW, (m_maincpu->state_int(NEC_AW) & 0xff00) | 0x06);
-		m_irq_vector = 0x81;
-		m_maincpu->set_input_line(0, HOLD_LINE);
+		m_pic->ir1_w(1);
+		m_pic->ir1_w(0);
 	}
 	emu_timer *m_kb_timer = nullptr;
-	IRQ_CALLBACK_MEMBER(irq_ack) { uint8_t v = m_irq_vector; m_irq_vector = 0x80; return v; }
+	IRQ_CALLBACK_MEMBER(irq_ack)
+	{
+		// once the BIOS has programmed the controller its own vector
+		// wins; until then fall back to the measured tick vector
+		uint8_t const v = m_pic->acknowledge();
+		return v ? v : 0x80;
+	}
 };
 
 
@@ -193,6 +204,14 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
 		return m_pit->read((offset >> 1) & 3);
 
+	// D71059 interrupt controller (8259 clone), reachable at the
+	// IBM-style byte addresses 0x20/0x21: a port scan on a running
+	// machine reads a sensible mask there (0xbc = timer, keyboard and
+	// floppy enabled) and the vector table shows it programmed with
+	// vector base 0x80.
+	if ((offset << 1) == 0x20)
+		return m_pic->read((mem_mask & 0x00ff) ? 0 : 1);
+
 	// DMA controller at 0x2300-0x230f, byte addressed (registers run
 	// consecutively, odd addresses included - the diagnostic uses 0x230a
 	// as the single mask register and 0x230f as the all-mask one).
@@ -249,6 +268,15 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
 	{
 		m_pit->write((offset >> 1) & 3, data & 0xff);
+		return;
+	}
+
+	if ((offset << 1) == 0x20)
+	{
+		if (ACCESSING_BITS_0_7)
+			m_pic->write(0, data & 0xff);
+		if (ACCESSING_BITS_8_15)
+			m_pic->write(1, (data >> 8) & 0xff);
 		return;
 	}
 
@@ -474,6 +502,12 @@ void wltc_state::wltc(machine_config &config)
 	m_pit->set_clk<0>(8_MHz_XTAL / 4);
 	m_pit->set_clk<1>(8_MHz_XTAL / 4);
 	m_pit->set_clk<2>(8_MHz_XTAL / 4);
+	// counter 0 is the system tick on IRQ0, as the measured interrupt
+	// mask (0xbc) and vector table (INT 80h = the tick ISR) imply
+	m_pit->out_handler<0>().set(m_pic, FUNC(pic8259_device::ir0_w));
+
+	PIC8259(config, m_pic);
+	m_pic->out_int_callback().set_inputline(m_maincpu, 0);
 
 	TIMER(config, "tick").configure_periodic(FUNC(wltc_state::tick), attotime::from_hz(1000));
 
