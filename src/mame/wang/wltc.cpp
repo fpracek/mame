@@ -121,6 +121,7 @@ private:
 	// command byte written to port 0x2c1e.
 	uint8_t m_irq_vector = 0x80;
 	bool m_tick_int = false;
+	bool m_scsi_rst_irq = false;
 	uint8_t m_kb_reply = 0;
 	uint8_t m_index_sel = 0xff;
 	uint8_t m_rtc[0x40];
@@ -172,11 +173,31 @@ private:
 		m_pic->ir1_w(0);
 	}
 	emu_timer *m_kb_timer = nullptr;
+	void pic_int_w(int state)
+	{
+		if (!m_legacy_bios)
+			m_maincpu->set_input_line(0, state ? ASSERT_LINE : CLEAR_LINE);
+	}
+	void pit_out_w(int state)
+	{
+		if (m_legacy_bios && state)
+		{
+			logerror("PIT out edge -> INT @ %s\n", machine().time().as_string(6));
+			m_maincpu->set_input_line(0, HOLD_LINE);
+		}
+	}
 	IRQ_CALLBACK_MEMBER(irq_ack)
 	{
 		// once the BIOS has programmed the controller its own vector
-		// wins; until then fall back to the measured tick vector (the
-		// unprogrammed 8259 returns junk below the 0x80 base)
+		// wins; until then fall back to the vector the firmware family
+		// expects - the 4.02.03 IVT dump shows the tick on 0x80, while
+		// the 1986 POST installs its timer handler on vector 0x20
+		// (F0ECB: [0080] = F000:0F67) before sti. The unprogrammed 8259
+		// returns junk below either base.
+		// the 1986 firmware never initialises the 8259 at all: its
+		// timer interrupt is hard-vectored to 0x20
+		if (m_legacy_bios)
+			return 0x20;
 		uint8_t const v = m_pic->acknowledge();
 		return v >= 0x80 ? v : 0x80;
 	}
@@ -282,8 +303,18 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	// one register every other address: the diagnostic utility programs
 	// it with the classic control words (0x74 counter 1 mode 2, 0xb6
 	// counter 2 mode 3) followed by a 16-bit divisor, LSB then MSB.
+	// word offset already steps once per even port: offset & 3, not
+	// (offset >> 1) & 3 - the double halving sent every control-word
+	// write into counter 1 and made the POST timer test read a stale
+	// counter 0, failing "too early" into error 57
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
-		return m_pit->read((offset >> 1) & 3);
+	{
+		uint16_t const v = m_pit->read(offset & 3);
+		if (m_legacy_bios && !machine().side_effects_disabled())
+			logerror("PIT r[%d] = %02x @ %s\n", offset & 3, v,
+					machine().time().as_string(6));
+		return v;
+	}
 
 	// NCR 53C80 SCSI controller at 0x2700-0x270e, one register every
 	// other address in the standard order (output data, initiator
@@ -291,7 +322,12 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	// status, input data, reset parity). The internal Winchester and
 	// the external floppy drive both live on this bus.
 	if ((offset << 1) >= 0x2700 && (offset << 1) <= 0x270f)
-		return m_scsi->read((offset >> 1) & 7);
+	{
+		// reading reset-parity/interrupt clears the pending interrupt
+		if ((offset & 7) == 7 && !machine().side_effects_disabled())
+			m_scsi_rst_irq = false;
+		return m_scsi->read(offset & 7);
+	}
 
 	// Z8530 serial communications controller at 0x2500-0x2506, one
 	// register every other address in the classic B/A control/data
@@ -299,7 +335,7 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	// sequence (wr4 0x44, wr3 0xc0, wr5 0x60, wr11 0x55, wr12/13 baud,
 	// wr14 0x12, wr9 0x80 channel reset).
 	if ((offset << 1) >= 0x2500 && (offset << 1) <= 0x2507)
-		return m_scc->dc_ab_r((offset >> 1) & 3);
+		return m_scc->dc_ab_r(offset & 3);
 
 	// 8250-compatible serial port at the IBM-style byte addresses
 	// 0x3f8-0x3ff: a port scan on a running machine reads the classic
@@ -318,8 +354,13 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	// "13 Power On Diagnostics" and the Rev 0.06 banner, matching the
 	// photographs of a real machine powering up. Return the word with
 	// bit 13 clear.
+	// Bit 2 reflects the SCSI controller's pending interrupt: the POST
+	// SCSI test at F0FAF asserts RST through the 5380's initiator
+	// command register, expects this bit to rise, clears the interrupt
+	// by reading the reset-parity register at 0x270e and expects it to
+	// fall again.
 	if ((offset << 1) == 0x2b0a)
-		return 0xdfff;
+		return 0xdffb | (m_scsi_rst_irq ? 0x0004 : 0);
 
 	// Console status, read by the timer-tick device poller at E11C5 as
 	// port (selector << 8) | 0x62 with the console's selector 0x10. The
@@ -469,19 +510,26 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
 	{
-		m_pit->write((offset >> 1) & 3, data & 0xff);
+		if (m_legacy_bios && !machine().side_effects_disabled())
+			logerror("PIT w[%d] = %02x @ %s\n", offset & 3, data & 0xff,
+					machine().time().as_string(6));
+		m_pit->write(offset & 3, data & 0xff);
 		return;
 	}
 
 	if ((offset << 1) >= 0x2700 && (offset << 1) <= 0x270f)
 	{
-		m_scsi->write((offset >> 1) & 7, data & 0xff);
+		// asserting RST through the initiator command register raises
+		// the 5380 interrupt, visible in bit 2 of 0x2b0a
+		if ((offset & 7) == 1 && (data & 0x80) && !machine().side_effects_disabled())
+			m_scsi_rst_irq = true;
+		m_scsi->write(offset & 7, data & 0xff);
 		return;
 	}
 
 	if ((offset << 1) >= 0x2500 && (offset << 1) <= 0x2507)
 	{
-		m_scc->dc_ab_w((offset >> 1) & 3, data & 0xff);
+		m_scc->dc_ab_w(offset & 3, data & 0xff);
 		return;
 	}
 
@@ -921,7 +969,9 @@ void wltc_state::machine_reset()
 
 void wltc_state::mem_map(address_map &map)
 {
-	map(0x00000, 0x7ffff).ram().share("lowram");
+	// 640K: the 1986 POST pattern-tests 0x00000-0x9ffff as one block
+	// and reports "51 Memory Error" if any of it fails to read back
+	map(0x00000, 0x9ffff).ram().share("lowram");
 	// CGA-style text buffer: the character output service runs with
 	// DS=B800 and 80-column rows, attribute 0x07 - the standard IBM
 	// text segment, kept by the BIOS as the source for the LCD refresh
@@ -991,15 +1041,39 @@ void wltc_state::wltc(machine_config &config)
 		m_maincpu->space(AS_PROGRAM).write_byte(offset, data); });
 
 	PIT8254(config, m_pit);
-	m_pit->set_clk<0>(8_MHz_XTAL / 4);
-	m_pit->set_clk<1>(8_MHz_XTAL / 4);
-	m_pit->set_clk<2>(8_MHz_XTAL / 4);
+	// 3.072 MHz: the POST timer test at F032B loads counter 0 with 2000
+	// in mode 0 and demands the OUT pin rise between its 8th and 10th
+	// polling attempt (~73us each as the V30 executes the delay loops) -
+	// a window of roughly 580-730us that only a clock near 3 MHz
+	// satisfies. 2000 / 3.072 MHz = 651us, attempt nine, and 3.072 MHz
+	// is a standard crystal.
+	// Calibrated against the POST's own timer tests, which poll the OUT
+	// pin in a software loop and demand it rise between the 8th and
+	// 10th attempt: counter 0 with a divisor of 2000, counter 1 - on a
+	// quarter of the clock - with 500, its polling slowed further by
+	// the timer ISR running in between. 2.7648 MHz (a standard
+	// baud-rate crystal) lands counter 0 on attempt ten and counter 1
+	// on attempt nine, both inside the window; 3.072 MHz leaves
+	// counter 1 one attempt early.
+	m_pit->set_clk<0>(2'764'800);
+	m_pit->set_clk<1>(2'764'800 / 4);
+	m_pit->set_clk<2>(2'764'800 / 4);   // tested identically to counter 1
 	// counter 0 is the system tick on IRQ0, as the measured interrupt
 	// mask (0xbc) and vector table (INT 80h = the tick ISR) imply
 	m_pit->out_handler<0>().set(m_pic, FUNC(pic8259_device::ir0_w));
+	// counters 1 and 2 interrupt through the gate array on the 1986
+	// hardware (vectors 0x20/0x21, enabled by bits 0/1 of port 0x2202);
+	// deliver their OUT edges straight to the CPU INT line there - the
+	// 8259 is never initialised by that firmware
+	m_pit->out_handler<1>().set(FUNC(wltc_state::pit_out_w));
+	m_pit->out_handler<2>().set(FUNC(wltc_state::pit_out_w));
 
 	PIC8259(config, m_pic);
-	m_pic->out_int_callback().set_inputline(m_maincpu, 0);
+	// through a gate: the unprogrammed 8259 answers every IR update
+	// with INT low, and wired straight to the CPU that CLEAR_LINE races
+	// the gate-array interrupts the 1986 firmware relies on - its timer
+	// edge got erased before the CPU could take it
+	m_pic->out_int_callback().set(FUNC(wltc_state::pic_int_w));
 
 	// NCR 53C80 SCSI bus at 0x2700: the JVC Winchester sits on it, and
 	// so does the external floppy drive
