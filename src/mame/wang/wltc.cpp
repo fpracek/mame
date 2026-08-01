@@ -436,6 +436,14 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		const int off = 0x88 * 4;
 		m_ivt_seed_rom[off] = 0x19; m_ivt_seed_rom[off + 1] = 0x00;
 		m_ivt_seed_rom[off + 2] = 0x00; m_ivt_seed_rom[off + 3] = 0xe0;
+
+		// Tried and rejected: sending the CPU back to the reset vector
+		// with the register file intact, on the theory that phase B
+		// inherits the DS=E35F that phase A ends with and that this is
+		// where the far call at E007F gets the data segment it has to
+		// pass on. It makes no difference, because the cold start loads
+		// DS itself - mov ax,0x40 / mov ds,ax at E005D, the source
+		// segment for its own copy - before ever reaching the call.
 		m_maincpu->pulse_input_line(INPUT_LINE_RESET, attotime::zero);
 	}
 }
@@ -735,6 +743,10 @@ ROM_START( wltc )
 	ROMX_LOAD( "myf000.bin", 0x10000, 0x8000, CRC(b0d23b9d) SHA1(c068b6c897b2ffea222ff7a38d3f39ac6fba54a4), ROM_BIOS(0) )
 	ROMX_LOAD( "myf800.bin", 0x18000, 0x8000, CRC(0d458043) SHA1(5019b085fa245dd3461d8d8811d40064875b605b), ROM_BIOS(0) )
 	// earlier revision (1985/1986 copyright), 64K at 0xf0000, even/odd EPROM pair
+	ROM_SYSTEM_BIOS( 1, "v1986", "1986 BIOS" )
+	ROMX_LOAD( "mainboard_a.bin", 0x10000, 0x8000, CRC(2ac9a03c) SHA1(29b5a0d5343f770628ed0089a2b8a87d518bb251), ROM_BIOS(1) | ROM_SKIP(1) )
+	ROMX_LOAD( "mainboard_b.bin", 0x10001, 0x8000, CRC(f38aec77) SHA1(926b947a7411a2bfa6394b6b9dfd5118bcb27228), ROM_BIOS(1) | ROM_SKIP(1) )
+
 	// BIOS 4.00 as shipped on the system diskette: the file is a shadow
 	// image for segment E000 (cold start at 0x18, far call operand E4B0),
 	// recovered with scantool/estrai_fat.py. It is 0x9061 bytes, so the
@@ -744,10 +756,6 @@ ROM_START( wltc )
 	ROMX_LOAD( "biossys400_b.bin", 0x08000, 0x8000, CRC(7538a123) SHA1(ae92cd372dafc8b0aa90d8aa32e483544c0576ea), ROM_BIOS(2) )
 	ROMX_LOAD( "myf000.bin", 0x10000, 0x8000, CRC(b0d23b9d) SHA1(c068b6c897b2ffea222ff7a38d3f39ac6fba54a4), ROM_BIOS(2) )
 	ROMX_LOAD( "myf800.bin", 0x18000, 0x8000, CRC(0d458043) SHA1(5019b085fa245dd3461d8d8811d40064875b605b), ROM_BIOS(2) )
-
-	ROM_SYSTEM_BIOS( 1, "v1986", "1986 BIOS" )
-	ROMX_LOAD( "mainboard_a.bin", 0x10000, 0x8000, CRC(2ac9a03c) SHA1(29b5a0d5343f770628ed0089a2b8a87d518bb251), ROM_BIOS(1) | ROM_SKIP(1) )
-	ROMX_LOAD( "mainboard_b.bin", 0x10001, 0x8000, CRC(f38aec77) SHA1(926b947a7411a2bfa6394b6b9dfd5118bcb27228), ROM_BIOS(1) | ROM_SKIP(1) )
 ROM_END
 
 } // anonymous namespace
