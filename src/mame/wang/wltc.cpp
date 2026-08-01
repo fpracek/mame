@@ -65,7 +65,7 @@ private:
 	required_shared_ptr<uint16_t> m_fram;
 	bool m_boot_mirror = false;
 	std::vector<uint8_t> m_fseg_logged;
-	uint8_t m_ivt_seed_rom[0x40];
+	uint8_t m_ivt_seed_rom[0x240];
 
 	void mem_map(address_map &map) ATTR_COLD;
 	void io_map(address_map &map) ATTR_COLD;
@@ -189,8 +189,8 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	{
 		logerror("cpu reset via 2b1e, INT88 vector -> phase B init\n");
 		// vector 0x88 lives in the ROM-backed window: patch the backing
-		// buffer directly (offset 0x04 + (0x88-0x80)*4)
-		const int off = 0x04 + 8 * 4;
+		// buffer directly
+		const int off = 0x88 * 4;
 		m_ivt_seed_rom[off] = 0x19; m_ivt_seed_rom[off + 1] = 0x00;
 		m_ivt_seed_rom[off + 2] = 0x00; m_ivt_seed_rom[off + 3] = 0xe0;
 		m_maincpu->pulse_input_line(INPUT_LINE_RESET, attotime::zero);
@@ -261,11 +261,14 @@ void wltc_state::machine_reset()
 		m_ivt_seed_rom[off + 2] = (v >> 16) & 0xff;
 		m_ivt_seed_rom[off + 3] = (v >> 24) & 0xff;
 	};
-	put32(0x00, 0xe0000384);                                 // vector 0x63
+	// the whole seeded IVT (vectors 0x00-0x8F) is ROM-backed: the
+	// intentional low-area clear must not destroy the trap vectors
+	// (vector 0x63 provably survives on real hardware)
+	for (int i = 0; i < 0x90; i++)
+		put32(i * 4, 0xe0000384);
 	for (int i = 0; i < 16; i++)
-		put32(0x04 + i * 4, ivt_seed[i]);
-	m_maincpu->space(AS_PROGRAM).install_rom(0x18c, 0x18f, &m_ivt_seed_rom[0x00]);
-	m_maincpu->space(AS_PROGRAM).install_rom(0x200, 0x23f, &m_ivt_seed_rom[0x04]);
+		put32((0x80 + i) * 4, ivt_seed[i]);
+	m_maincpu->space(AS_PROGRAM).install_rom(0x000, 0x23f, &m_ivt_seed_rom[0x00]);
 }
 
 
@@ -304,7 +307,7 @@ void wltc_state::wltc(machine_config &config)
 	m_maincpu->set_addrmap(AS_IO, &wltc_state::io_map);
 	m_maincpu->set_irq_acknowledge_callback(FUNC(wltc_state::irq_ack));
 
-	TIMER(config, "tick").configure_periodic(FUNC(wltc_state::tick), attotime::from_hz(60));
+	TIMER(config, "tick").configure_periodic(FUNC(wltc_state::tick), attotime::from_hz(1000));
 
 	screen_device &screen(SCREEN(config, "screen", SCREEN_TYPE_LCD));
 	screen.set_refresh_hz(60);
