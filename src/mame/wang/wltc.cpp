@@ -440,6 +440,15 @@ void wltc_state::machine_reset()
 	// vector is an ordinary far jump (ea aa 00 00 fc = jmp FC00:00AA),
 	// not the int 0x88 convention: none of the gate-array scaffolding
 	// below (shadow RAM, boot mirror, seeded IVT) applies to it.
+	// Boot patches, applied to the ROM image before it is copied into
+	// the shadow: the init routine at E4C2 starts at offset 0x63 (the
+	// bytes before it are a data table, as the stack accounting and a
+	// dump of a running machine both show), and its final return has
+	// to be a far one, since it is reached through a far call - a near
+	// return would keep CS at E4C2 and land mid-instruction at E4CA4.
+	memregion("bios")->base()[0x0080] = 0x63;
+	memregion("bios")->base()[0x4d56] = 0xcb;
+
 	uint8_t const *const bios = memregion("bios")->base();
 	m_legacy_bios = (bios[0] == 0xff && bios[1] == 0xff);   // E half blank: 64K image
 	if (m_legacy_bios)
@@ -481,7 +490,6 @@ void wltc_state::machine_reset()
 	// (patch the ROM image itself: the cold start copies its first page
 	// back over the shadow from the boot mirror, so patching only the
 	// shadow would be undone)
-	memregion("bios")->base()[0x0080] = 0x63;
 
 	// The reset vector executes mov al,0x10 / int 0x88, so the gate
 	// array must seed the interrupt vector table at power-on. Use the
