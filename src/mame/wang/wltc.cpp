@@ -292,7 +292,8 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 
 	// Reads of the boot overlay switch to the underlying RAM at the
 	// port 0x200 read inside the relocation walk: all ROM-sourced
-	// pipeline reads are done by then.
+	// pipeline reads are done by then. (Dead in the current flow, which
+	// never reads 0x200 - the live trigger is the 0x2d00 write in io_w.)
 	if ((offset << 1) == 0x200 && m_boot_mirror && !machine().side_effects_disabled())
 	{
 		logerror("boot overlay reads -> RAM (0200 read)\n");
@@ -488,18 +489,17 @@ void wltc_state::machine_reset()
 	// Reads switch to the underlying RAM at the port 0x200 read inside
 	// the relocation walk (see io_r).
 	//
-	// The overlay is scaffolding, not a hardware model, and the POST now
-	// runs far enough to show it. Phase A - everything between the reset
-	// vector and the port 0x2b1e CPU reset - is 84 instructions long and
-	// copies nothing, so on real hardware low memory during phase B is
-	// whatever the gate array leaves there. It is not the EPROM: the
-	// message dispatcher at E1280 reads a device-table pointer from
-	// 0040:00AF, and neither aliasing model produces a usable table
-	// (offset-mirrored gives SI=0x000E with a count of 0xADEA, a 1:1
-	// alias gives SI=0xAAEC with a count of 0xC7F6). Something builds
-	// those tables before the BIOS runs, and finding it is what stands
-	// between the POST and its first printed line - see the wait at
-	// E14A6 below.
+	// The overlay is genuine hardware, not scaffolding: the cold start
+	// reads 0x0fe0 bytes up from 0000:0401 through DS=0x0040 and copies
+	// them over E000:0001-0fe0, taking a block of constants with it -
+	// the pops at E0070-0073 come out as AX=09C0 BX=0611 CX=059C
+	// DX=0200, exactly ROM 0x2c-0x33. Without the EPROM readable down
+	// there the machine cannot load its own shadow.
+	//
+	// It does get dropped later - Wolfgang's machine reads 0040:0980 and
+	// 0040:00A0 back as zeroed RAM under DOS - but nothing in the POST
+	// depends on that any more, now that the BIOS data segment is known
+	// to be E35F rather than 0x0040 (see the wait at E14A6 below).
 	m_maincpu->space(AS_PROGRAM).install_rom(0x00400, 0x0f7ff, memregion("bios")->base());
 	m_maincpu->space(AS_PROGRAM).install_writeonly(0x00400, 0x0f7ff,
 			reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x400);
@@ -529,6 +529,28 @@ void wltc_state::machine_reset()
 	// E4B0:0000 instead and holds an ordinary routine prologue there, so
 	// it needs no stub: the workaround is specific to the 4.02.03 EPROM
 	// layout and is keyed off that image's far-call operand.
+	//
+	// The stub gets the entry point right but not the entry state. The
+	// body at E4C2:0063 works on a device descriptor in DS:SI and takes
+	// BP-relative parameters (mov ds,[bp+0ch] at E4DF5, mov [bp+4],bx at
+	// E4DCF), and it needs DS to be the BIOS data segment E35F - the
+	// value the get-segment service returns for id 0x18, and the one the
+	// other three callers of the POST printer load explicitly before
+	// calling it (E035B: mov bx,18h / lcall E000:0009 / mov ds,ax).
+	// Everything the POST reads resolves in that segment and only there:
+	// the console-ready flag at [0980] is already 0xff, the device-table
+	// pointer at [00AF] is 0x005b, and the table there holds one device
+	// whose descriptor carries port selector 0x10 - the console, port
+	// 0x2a08. The function table the phase-A dispatcher jumps through
+	// pins the segment down: only DS=E35F puts 0x146a at [0A71], which
+	// is where that jump actually goes.
+	//
+	// The cold start leaves DS as 0x0040, the source segment of its own
+	// copy, and nothing between there and the far call sets it. Feeding
+	// the routine DS=E35F and SI=0x3a03 by hand gets the POST to
+	// rasterise its first line of text, so the rest of the machine is
+	// close; what establishes that state on real hardware is the open
+	// question.
 	{
 		uint8_t *const shadow = reinterpret_cast<uint8_t *>(m_shadow.target());
 		if (shadow[0x80] == 0x00 && shadow[0x81] == 0x00
