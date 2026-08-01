@@ -37,6 +37,7 @@
 #include "emu.h"
 #include "cpu/nec/nec.h"
 #include "machine/am9517a.h"
+#include "machine/ins8250.h"
 #include "machine/pic8259.h"
 #include "machine/pit8253.h"
 #include "machine/timer.h"
@@ -54,6 +55,7 @@ public:
 		m_pit(*this, "pit"),
 		m_dmac(*this, "dmac"),
 		m_pic(*this, "pic"),
+		m_uart(*this, "uart"),
 		m_shadow(*this, "shadow"),
 		m_lowram(*this, "lowram"),
 		m_fram(*this, "fram")
@@ -69,6 +71,7 @@ private:
 	required_device<pit8254_device> m_pit;
 	required_device<am9517a_device> m_dmac;
 	required_device<pic8259_device> m_pic;
+	required_device<ins8250_device> m_uart;
 	required_shared_ptr<uint16_t> m_shadow;
 	required_shared_ptr<uint16_t> m_lowram;
 	required_shared_ptr<uint16_t> m_fram;
@@ -204,6 +207,15 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
 		return m_pit->read((offset >> 1) & 3);
 
+	// 8250-compatible serial port at the IBM-style byte addresses
+	// 0x3f8-0x3ff: a port scan on a running machine reads the classic
+	// idle values there (line status 0x60, interrupt ident 0x01).
+	if ((offset << 1) >= 0x3f8 && (offset << 1) <= 0x3ff)
+	{
+		int const reg = (offset << 1) - 0x3f8 + ((mem_mask & 0x00ff) ? 0 : 1);
+		return m_uart->ins8250_r(reg & 7);
+	}
+
 	// D71059 interrupt controller (8259 clone), reachable at the
 	// IBM-style byte addresses 0x20/0x21: a port scan on a running
 	// machine reads a sensible mask there (0xbc = timer, keyboard and
@@ -268,6 +280,16 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
 	{
 		m_pit->write((offset >> 1) & 3, data & 0xff);
+		return;
+	}
+
+	if ((offset << 1) >= 0x3f8 && (offset << 1) <= 0x3ff)
+	{
+		int const reg = (offset << 1) - 0x3f8;
+		if (ACCESSING_BITS_0_7)
+			m_uart->ins8250_w(reg & 7, data & 0xff);
+		if (ACCESSING_BITS_8_15)
+			m_uart->ins8250_w((reg + 1) & 7, (data >> 8) & 0xff);
 		return;
 	}
 
@@ -508,6 +530,10 @@ void wltc_state::wltc(machine_config &config)
 
 	PIC8259(config, m_pic);
 	m_pic->out_int_callback().set_inputline(m_maincpu, 0);
+
+	// 8250-compatible UART at 0x3f8, with the usual 1.8432 MHz clock
+	INS8250(config, m_uart, 1'843'200);
+	m_uart->out_int_callback().set(m_pic, FUNC(pic8259_device::ir4_w));
 
 	TIMER(config, "tick").configure_periodic(FUNC(wltc_state::tick), attotime::from_hz(1000));
 
