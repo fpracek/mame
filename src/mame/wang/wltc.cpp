@@ -65,7 +65,8 @@ public:
 		m_shadow(*this, "shadow"),
 		m_lowram(*this, "lowram"),
 		m_fram(*this, "fram"),
-		m_textram(*this, "textram")
+		m_textram(*this, "textram"),
+		m_monoram(*this, "monoram")
 	{ }
 
 	void wltc(machine_config &config);
@@ -86,6 +87,7 @@ private:
 	required_shared_ptr<uint16_t> m_lowram;
 	required_shared_ptr<uint16_t> m_fram;
 	required_shared_ptr<uint16_t> m_textram;
+	required_shared_ptr<uint16_t> m_monoram;
 	bool m_boot_mirror = false;
 	std::vector<uint8_t> m_fseg_logged;
 	uint8_t m_ivt_seed_rom[0x240];
@@ -193,12 +195,23 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 	// of the EPROM's 8x16 font. An empty buffer falls back to the
 	// 640x200 bitmap in the banked memory behind the window at 0xf2000
 	// (the diagnostic and the video test draw pixels directly).
-	bool text = false;
-	for (int i = 0; i < 80 * 25 && !text; i++)
-		text = (m_textram[i] & 0xff) > 0x20 && (m_textram[i] & 0xff) < 0x7f;
+	// The 1986 BIOS composes its POST messages in the mono buffer at
+	// 0xb0000; the 4.02.03 console uses the colour buffer at 0xb8000.
+	// Render whichever holds text.
+	uint16_t const *tbuf = nullptr;
+	for (int i = 0; i < 80 * 25 && !tbuf; i++)
+		if ((m_textram[i] & 0xff) > 0x20 && (m_textram[i] & 0xff) < 0x7f)
+			tbuf = m_textram;
+	for (int i = 0; i < 80 * 25 && !tbuf; i++)
+		if ((m_monoram[i] & 0xff) > 0x20 && (m_monoram[i] & 0xff) < 0x7f)
+			tbuf = m_monoram;
 
-	if (text)
+	if (tbuf)
 	{
+		// the glyphs at ROM 0xf5d1: the BIOS's own font for 4.02.03,
+		// and a stand-in for the LCD controller's internal character
+		// generator on the 1986 hardware (whose BIOS only ever writes
+		// character/attribute pairs - the controller renders them)
 		uint8_t const *const font = memregion("bios")->base() + 0xf5d1;
 		for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
 		{
@@ -206,7 +219,7 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 			uint32_t *dst = &bitmap.pix(y, cliprect.left());
 			for (int x = cliprect.left(); x <= cliprect.right(); x++)
 			{
-				uint8_t const ch = m_textram[(row * 80) + (x >> 3)] & 0xff;
+				uint8_t const ch = tbuf[(row * 80) + (x >> 3)] & 0xff;
 				uint8_t const bits = font[(ch << 4) + (line << 1) + 1];
 				*dst++ = BIT(bits, 7 - (x & 7)) ? fg : bg;
 			}
@@ -435,6 +448,23 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		m_maincpu->space(AS_PROGRAM).install_rom(0x00420, 0x01a2f,
 				memregion("bios")->base() + 0x35f0 + 0x20);
 		m_boot_mirror = false;
+	}
+
+	// Map control for the F segment on the 1986 hardware. The customer
+	// POST hops between segments through low-RAM trampolines that write
+	// this port mid-flight: 0x1e (bit 0 clear) puts RAM behind F000 so
+	// the POST, now running from the E alias, can pattern-test it
+	// destructively; 0x1f (bit 0 set) puts the EPROM back and execution
+	// returns to F000:0326 expecting its code there. Without the switch
+	// the return lands in the test-wiped RAM and marches.
+	if (m_legacy_bios && (offset << 1) == 0x2d02 && !machine().side_effects_disabled())
+	{
+		if (data & 1)
+			m_maincpu->space(AS_PROGRAM).install_rom(0xf0000, 0xfffff,
+					memregion("bios")->base() + 0x10000);
+		else
+			m_maincpu->space(AS_PROGRAM).install_ram(0xf0000, 0xfffff,
+					reinterpret_cast<uint8_t *>(m_fram.target()));
 	}
 
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
@@ -1015,6 +1045,10 @@ ROM_START( wltc )
 	ROM_SYSTEM_BIOS( 1, "v1986", "1986 BIOS" )
 	ROMX_LOAD( "mainboard_a.bin", 0x10000, 0x8000, CRC(2ac9a03c) SHA1(29b5a0d5343f770628ed0089a2b8a87d518bb251), ROM_BIOS(1) | ROM_SKIP(1) )
 	ROMX_LOAD( "mainboard_b.bin", 0x10001, 0x8000, CRC(f38aec77) SHA1(926b947a7411a2bfa6394b6b9dfd5118bcb27228), ROM_BIOS(1) | ROM_SKIP(1) )
+	// the 1986 BIOS only writes character/attribute pairs; the LCD
+	// controller renders them from its own character generator, stood
+	// in for here by the font half of the later EPROM set
+	ROMX_LOAD( "mye800.bin", 0x08000, 0x8000, CRC(e25f4f8d) SHA1(f0bcaeb2120177ca023b5b8076852a1dfe4d5635), ROM_BIOS(1) )
 
 	// BIOS 4.00 as shipped on the system diskette: the file is a shadow
 	// image for segment E000 (cold start at 0x18, far call operand E4B0),
