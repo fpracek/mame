@@ -111,6 +111,7 @@ private:
 	uint8_t m_index_sel = 0xff;
 	uint8_t m_rtc[0x40];
 	uint16_t m_unmapped_value = 0xffff;
+	uint8_t m_vram_bank[2] = { 0, 0 };
 	// Boot-time tick as NMI: the whole boot runs with IF clear (no sti
 	// executed until the E0084 path), yet the hlt/inc-cw delay loops
 	// must advance - only NMI wakes a halted V30 with interrupts off,
@@ -310,6 +311,18 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		if (ACCESSING_BITS_8_15)
 			m_dmac->write((reg + 1) & 0x0f, (data >> 8) & 0xff);
 		return;
+	}
+
+	// Display control registers, one per screen: the low nibble selects
+	// a video memory bank behind the window at 0xf2000 (the diagnostic
+	// tests the banks one at a time through these ports, and the 1986
+	// BIOS clears both at the end of its display init).
+	if ((offset << 1) == 0x2d0a || (offset << 1) == 0x2d0c)
+	{
+		int const screen = ((offset << 1) == 0x2d0a) ? 0 : 1;
+		if (m_vram_bank[screen] != (data & 0x0f))
+			logerror("display %d: bank %x\n", screen, data & 0x0f);
+		m_vram_bank[screen] = data & 0x0f;
 	}
 
 	// index register of the clock/scratch device, and its data port
