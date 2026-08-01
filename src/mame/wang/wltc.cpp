@@ -197,11 +197,25 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	case 0x204:  logerror("0204 stub hit\n");
 	             return 0x0000; // boot-time device status, bit0 tested after read
 	                            // (experiment: report clear; reads 0xff at DOS time)
-	case 0x2a00: // index/data device: the BIOS selects an index on 0x2c00
-	             // and polls the answer here. On real hardware indexes
-	             // 0x30/0x31 answer 0xdb; give a plain acknowledge for
-	             // the boot-time indexes so the POST poll completes.
-	             return m_index_sel;
+	case 0x2a00:
+		// Index/data device on 0x2c00 (index) / 0x2a00 (data): the gate
+		// array real-time clock. The POST range-checks the fields it
+		// reads back (month 1-12 at index 0x10, hour 0-23 at 0x13,
+		// second 0-99 at 0x12) and beeps and halts if any is out of
+		// range, so return a plausible date and time.
+		switch (m_index_sel)
+		{
+		case 0x0a: // status: the POST waits for bit 7 to pulse
+			return (machine().time().as_ticks(120) & 1) ? 0x80 : 0x00;
+		case 0x10: return 0x01;  // month  (1-12 checked)
+		case 0x11: return 0x01;  // day    (1-31 checked)
+		case 0x12: return 0x00;  // second (0-99 checked)
+		case 0x13: return 0x00;  // hour   (0-23 checked)
+		case 0x14: return 0x00;  // minute (0-59 checked)
+		case 0x15: return 0x00;
+		case 0x0e: return 0x00;  // boot counter, incremented by the POST
+		}
+		return m_index_sel;
 	case 0x2a08: return 0x0044; // handshake status, bit7 = busy, measured idle
 	case 0x2b02: return 0x00fe; // measured 0xfc idle; bit1 (ready to accept) forced high
 	case 0x2e1e: return 0x00f4; // mode/config register, measured on real hardware:
