@@ -65,6 +65,7 @@ private:
 	required_shared_ptr<uint16_t> m_fram;
 	bool m_boot_mirror = false;
 	std::vector<uint8_t> m_fseg_logged;
+	uint8_t m_ivt_seed_rom[0x40];
 
 	void mem_map(address_map &map) ATTR_COLD;
 	void io_map(address_map &map) ATTR_COLD;
@@ -146,16 +147,16 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	if (!machine().side_effects_disabled())
 		logerror("%06x: io_r %04x mask %04x\n", m_maincpu->pc(), offset << 1, mem_mask);
 
-	// The boot EPROM mirror goes away at the port 0x200 read inside the
-	// relocation walk: every ROM read through the mirror is done by
-	// then, and an instrumented comparison shows this is the designed
-	// timing - with RAM contents the threaded dispatch at E9BF3 lands
-	// on the real handler sequence (E885C...), with ROM it derails.
+	// Reads of the boot overlay switch to the underlying RAM at the
+	// port 0x200 read inside the relocation walk: all ROM-sourced
+	// pipeline reads are done by then.
 	if ((offset << 1) == 0x200 && m_boot_mirror && !machine().side_effects_disabled())
 	{
-		logerror("boot mirror disabled (0200 read)\n");
-		m_maincpu->space(AS_PROGRAM).install_ram(0x00400, 0x03fff,
+		logerror("boot overlay reads -> RAM (0200 read)\n");
+		m_maincpu->space(AS_PROGRAM).install_ram(0x00400, 0x0f7ff,
 				reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x400);
+		m_maincpu->space(AS_PROGRAM).install_ram(0x10000, 0x103ff,
+				reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x10000);
 		m_boot_mirror = false;
 	}
 
@@ -178,19 +179,6 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
 	logerror("%06x: io_w %04x = %04x mask %04x\n", m_maincpu->pc(), offset << 1, data, mem_mask);
 
-	// The write to port 0x204 happens right between the table-driven init
-	// phase (which still reads the boot EPROM mirror through segment
-	// 0x40) and the keyboard handshake (which needs RAM flags at
-	// 0x417/0x418): treat it as the mirror disable until the real
-	// mechanism is identified.
-	if ((offset << 1) == 0x204 && m_boot_mirror)
-	{
-		logerror("boot mirror disabled\n");
-		m_maincpu->space(AS_PROGRAM).install_ram(0x00400, 0x03fff,
-				reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x400);
-		m_boot_mirror = false;
-	}
-
 	// Writing 1 to port 0x2b1e triggers a CPU reset and advances the
 	// boot phase: the gate array swaps the INT 88h vector from the
 	// phase-A hardware init entry (E000:0019, the relocating start with
@@ -200,7 +188,11 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	if ((offset << 1) == 0x2b1e && (data & 1))
 	{
 		logerror("cpu reset via 2b1e, INT88 vector -> phase B init\n");
-		m_maincpu->space(AS_PROGRAM).write_dword(0x88 * 4, 0xe0000019);
+		// vector 0x88 lives in the ROM-backed window: patch the backing
+		// buffer directly (offset 0x04 + (0x88-0x80)*4)
+		const int off = 0x04 + 8 * 4;
+		m_ivt_seed_rom[off] = 0x19; m_ivt_seed_rom[off + 1] = 0x00;
+		m_ivt_seed_rom[off + 2] = 0x00; m_ivt_seed_rom[off + 3] = 0xe0;
 		m_maincpu->pulse_input_line(INPUT_LINE_RESET, attotime::zero);
 	}
 }
@@ -215,16 +207,21 @@ void wltc_state::machine_reset()
 	memcpy(m_shadow, memregion("bios")->base(), 0x10000);
 	m_fseg_logged.assign(0x8000, 0);
 
-	// At reset the EPROMs are mirrored (read only, writes discarded) from
-	// 0x400 up: the cold start copies its first page from there and the
-	// init phase keeps reading data tables through segment 0x40. The
-	// mirror goes away mid-POST (see io_w on port 0x204), after which
-	// segment 0x40 becomes the BIOS low data area in RAM.
-	// The mirror only needs to cover the boot-time ROM reads (copy
-	// source at 0x400-0x4ff, walk data tables up to ~0x39ff): the top
-	// of segment 0 must stay RAM, the INT 88h dispatcher builds its
-	// manufactured interrupt frames on a stack at 0000:FFEx.
-	m_maincpu->space(AS_PROGRAM).install_rom(0x00400, 0x03fff, memregion("bios")->base());
+	// Boot overlay: reads come from the EPROM mirrored at 0x400, writes
+	// go through to the RAM underneath (the ES=0 clear that zeroes the
+	// BDA/IVT area is intentional - it initializes the low data area,
+	// and its zeros must land). The mirror spans 0x400-0xf7ff plus the
+	// spill at 0x10000-0x103ff (the vector-install path ends with
+	// retf 1000:000D into mirrored code at ROM 0xfc0d); 0xf800-0xffff
+	// stays RAM for the manufactured interrupt frames at 0000:FFEx.
+	// Reads switch to the underlying RAM at the port 0x200 read inside
+	// the relocation walk (see io_r).
+	m_maincpu->space(AS_PROGRAM).install_rom(0x00400, 0x0f7ff, memregion("bios")->base());
+	m_maincpu->space(AS_PROGRAM).install_writeonly(0x00400, 0x0f7ff,
+			reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x400);
+	m_maincpu->space(AS_PROGRAM).install_rom(0x10000, 0x103ff, memregion("bios")->base() + 0xfc00);
+	m_maincpu->space(AS_PROGRAM).install_writeonly(0x10000, 0x103ff,
+			reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x10000);
 	m_boot_mirror = true;
 
 	// The reset vector executes mov al,0x10 / int 0x88, so the gate
@@ -252,6 +249,23 @@ void wltc_state::machine_reset()
 	};
 	for (int i = 0; i < 16; i++)
 		m_maincpu->space(AS_PROGRAM).write_dword((0x80 + i) * 4, ivt_seed[i]);
+
+	// The gate-array-provided vectors are ROM-backed: the intentional
+	// ES=0 clear that zeroes the low data area at boot must not destroy
+	// them (vector 0x63 still reads its seed on a running machine).
+	// Model the 0x63 slot and the 0x80-0x8F block as small ROM windows.
+	auto put32 = [this](int off, uint32_t v)
+	{
+		m_ivt_seed_rom[off] = v & 0xff;
+		m_ivt_seed_rom[off + 1] = (v >> 8) & 0xff;
+		m_ivt_seed_rom[off + 2] = (v >> 16) & 0xff;
+		m_ivt_seed_rom[off + 3] = (v >> 24) & 0xff;
+	};
+	put32(0x00, 0xe0000384);                                 // vector 0x63
+	for (int i = 0; i < 16; i++)
+		put32(0x04 + i * 4, ivt_seed[i]);
+	m_maincpu->space(AS_PROGRAM).install_rom(0x18c, 0x18f, &m_ivt_seed_rom[0x00]);
+	m_maincpu->space(AS_PROGRAM).install_rom(0x200, 0x23f, &m_ivt_seed_rom[0x04]);
 }
 
 
