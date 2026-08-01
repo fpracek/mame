@@ -40,6 +40,7 @@
 #include "machine/ins8250.h"
 #include "machine/pic8259.h"
 #include "machine/pit8253.h"
+#include "machine/z80scc.h"
 #include "machine/timer.h"
 #include "screen.h"
 
@@ -56,6 +57,7 @@ public:
 		m_dmac(*this, "dmac"),
 		m_pic(*this, "pic"),
 		m_uart(*this, "uart"),
+		m_scc(*this, "scc"),
 		m_shadow(*this, "shadow"),
 		m_lowram(*this, "lowram"),
 		m_fram(*this, "fram")
@@ -72,6 +74,7 @@ private:
 	required_device<am9517a_device> m_dmac;
 	required_device<pic8259_device> m_pic;
 	required_device<ins8250_device> m_uart;
+	required_device<scc8530_device> m_scc;
 	required_shared_ptr<uint16_t> m_shadow;
 	required_shared_ptr<uint16_t> m_lowram;
 	required_shared_ptr<uint16_t> m_fram;
@@ -208,6 +211,14 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
 		return m_pit->read((offset >> 1) & 3);
 
+	// Z8530 serial communications controller at 0x2500-0x2506, one
+	// register every other address in the classic B/A control/data
+	// order: the diagnostic initialises it with the textbook register
+	// sequence (wr4 0x44, wr3 0xc0, wr5 0x60, wr11 0x55, wr12/13 baud,
+	// wr14 0x12, wr9 0x80 channel reset).
+	if ((offset << 1) >= 0x2500 && (offset << 1) <= 0x2507)
+		return m_scc->dc_ab_r((offset >> 1) & 3);
+
 	// 8250-compatible serial port at the IBM-style byte addresses
 	// 0x3f8-0x3ff: a port scan on a running machine reads the classic
 	// idle values there (line status 0x60, interrupt ident 0x01).
@@ -281,6 +292,12 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
 	{
 		m_pit->write((offset >> 1) & 3, data & 0xff);
+		return;
+	}
+
+	if ((offset << 1) >= 0x2500 && (offset << 1) <= 0x2507)
+	{
+		m_scc->dc_ab_w((offset >> 1) & 3, data & 0xff);
 		return;
 	}
 
@@ -543,6 +560,10 @@ void wltc_state::wltc(machine_config &config)
 
 	PIC8259(config, m_pic);
 	m_pic->out_int_callback().set_inputline(m_maincpu, 0);
+
+	// Z8530APS serial communications controller at 0x2500
+	SCC8530(config, m_scc, 8_MHz_XTAL / 2);
+	m_scc->out_int_callback().set(m_pic, FUNC(pic8259_device::ir3_w));
 
 	// 8250-compatible UART at 0x3f8, with the usual 1.8432 MHz clock
 	INS8250(config, m_uart, 1'843'200);
