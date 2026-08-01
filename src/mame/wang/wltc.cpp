@@ -145,6 +145,20 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 {
 	if (!machine().side_effects_disabled())
 		logerror("%06x: io_r %04x mask %04x\n", m_maincpu->pc(), offset << 1, mem_mask);
+
+	// The boot EPROM mirror goes away at the port 0x200 read inside the
+	// relocation walk: every ROM read through the mirror is done by
+	// then, and an instrumented comparison shows this is the designed
+	// timing - with RAM contents the threaded dispatch at E9BF3 lands
+	// on the real handler sequence (E885C...), with ROM it derails.
+	if ((offset << 1) == 0x200 && m_boot_mirror && !machine().side_effects_disabled())
+	{
+		logerror("boot mirror disabled (0200 read)\n");
+		m_maincpu->space(AS_PROGRAM).install_ram(0x00400, 0x03fff,
+				reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x400);
+		m_boot_mirror = false;
+	}
+
 	// idle values measured on the real machine (LCD model) with DEBUG:
 	switch (offset << 1)
 	{
