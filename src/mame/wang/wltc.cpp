@@ -573,6 +573,20 @@ void wltc_state::machine_reset()
 	// rasterise its first line of text, so the rest of the machine is
 	// close; what establishes that state on real hardware is the open
 	// question.
+	//
+	// It is not that E0084 is entered from somewhere else. Offset 0x0084
+	// has no reference anywhere in the 128K of EPROM - no near call or
+	// jump, no word in the data area, no far pointer - and walking the
+	// flow from all twenty int 88h function entries never reaches it. It
+	// is the return address of the far call at E007F and nothing else,
+	// so this stub does hand control back to the right place.
+	//
+	// The routine the init calls at E4D46 shows the same missing state
+	// from another side: E5904 loads the character generator with
+	// mov ds,bx and reads glyphs from DS:SI, and the init never sets BX,
+	// so in this flow it fills from a garbage segment and scatters its
+	// writes across low memory. Entry state, again, not a missing
+	// device.
 	{
 		uint8_t *const shadow = reinterpret_cast<uint8_t *>(m_shadow.target());
 		if (!(ioport("CONFIG")->read() & 0x0002)
