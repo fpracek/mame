@@ -98,16 +98,28 @@ private:
 
 uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
 {
-	// LCD yellow-green on dark, like the real display
+	// 80x25 text from the CGA-style buffer at 0xb8000, rendered with
+	// the 8x16 font found in the EPROMs (char 0 glyph at MYE800+0x75d1),
+	// LCD yellow-green like the real display
 	const rgb_t fg(0x30, 0x38, 0x20), bg(0xc8, 0xd4, 0x40);
-	auto const *vram = reinterpret_cast<const uint8_t *>(m_fram.target()) + 0x2000;
+	auto const *text = reinterpret_cast<const uint8_t *>(m_lowram.target());  // unused fallback
+	auto const *tram = reinterpret_cast<const uint8_t *>(memshare("textram")->ptr());
+	auto const *font = memregion("bios")->base() + 0x8000 + 0x75d1;
+	(void)text;
 	for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
 	{
+		int const row = y >> 4, line = y & 15;
 		uint32_t *dst = &bitmap.pix(y, cliprect.left());
 		for (int x = cliprect.left(); x <= cliprect.right(); x++)
 		{
-			uint8_t const b = vram[y * 40 + (x >> 3)];
-			*dst++ = BIT(b, 7 - (x & 7)) ? fg : bg;
+			int const col = x >> 3;
+			uint8_t const chr = tram[(row * 80 + col) * 2];
+			uint8_t const attr = tram[(row * 80 + col) * 2 + 1];
+			uint8_t const bits = font[chr * 16 + line];
+			bool on = BIT(bits, 7 - (x & 7));
+			if (attr & 0x70)  // crude reverse video
+				on = !on;
+			*dst++ = on ? fg : bg;
 		}
 	}
 	return 0;
@@ -226,6 +238,10 @@ void wltc_state::machine_reset()
 void wltc_state::mem_map(address_map &map)
 {
 	map(0x00000, 0x7ffff).ram().share("lowram");
+	// CGA-style text buffer: the character output service runs with
+	// DS=B800 and 80-column rows, attribute 0x07 - the standard IBM
+	// text segment, kept by the BIOS as the source for the LCD refresh
+	map(0xb8000, 0xbffff).ram().share("textram");
 	// debug window: mirror of everything the BIOS writes into the F
 	// segment (VRAM and video registers), readable from Lua for dumps
 	map(0xa0000, 0xaffff).ram().share("fram");
@@ -258,8 +274,8 @@ void wltc_state::wltc(machine_config &config)
 
 	screen_device &screen(SCREEN(config, "screen", SCREEN_TYPE_LCD));
 	screen.set_refresh_hz(60);
-	screen.set_size(320, 200);
-	screen.set_visarea(0, 319, 0, 199);
+	screen.set_size(640, 400);
+	screen.set_visarea(0, 639, 0, 399);
 	screen.set_screen_update(FUNC(wltc_state::screen_update));
 }
 
