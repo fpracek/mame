@@ -299,8 +299,6 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		logerror("boot overlay reads -> RAM (0200 read)\n");
 		m_maincpu->space(AS_PROGRAM).install_ram(0x00400, 0x0f7ff,
 				reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x400);
-		m_maincpu->space(AS_PROGRAM).install_ram(0x10000, 0x103ff,
-				reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x10000);
 		m_boot_mirror = false;
 	}
 
@@ -334,6 +332,39 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
 	logerror("%06x: io_w %04x = %04x mask %04x\n", m_maincpu->pc(), offset << 1, data, mem_mask);
+
+	// At the first write to 0x2d00 - the first I/O the phase-B init
+	// issues once the cold start has copied itself into shadow RAM - the
+	// low-memory overlay switches from the EPROM base (which the copy
+	// and the E0070 constant pops needed) to the EPROM's data template
+	// at ROM 0x35f0, the image of segment E35F. That one remapping is
+	// what makes every phase-B read through DS=0x0040 resolve: the
+	// console-ready flag at [0980] reads 0xff, the device-table pointer
+	// at [00AF] reads 0x005b with its one console device, the function
+	// table at [0A51] carries the entries the dispatcher jumps through.
+	//
+	// It must be an alias, not a copy: the init later runs the character
+	// generator loader with an uninitialised source segment and sprays
+	// writes across low memory - installed as RAM the template gets
+	// wiped and the machine parks in the printer wait forever (measured;
+	// so did installing it as RAM at any earlier point). As a read-only
+	// window with writes passing to the RAM beneath, the flag survives
+	// and the POST walks straight through both banner prints to the
+	// boot path at 1000:000D. Whether the real gate array switches on
+	// this exact port write is unproven - but the switch itself has to
+	// exist, because the same bytes cannot serve as both copy source
+	// and data area.
+	if ((offset << 1) == 0x2d00 && m_boot_mirror && !machine().side_effects_disabled())
+	{
+		logerror("low overlay -> data template (2d00 write)\n");
+		// The first 0x20 bytes stay on the EPROM base: they hold the
+		// far-jump stub table (offsets 4/9/E/13 -> E25F/E332/E17A/E610)
+		// that the vector-install path points interrupt vectors at, and
+		// executing template data there is what derailed the first try.
+		m_maincpu->space(AS_PROGRAM).install_rom(0x00420, 0x01a2f,
+				memregion("bios")->base() + 0x35f0 + 0x20);
+		m_boot_mirror = false;
+	}
 
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
 	{
@@ -525,7 +556,16 @@ void wltc_state::machine_reset()
 	m_maincpu->space(AS_PROGRAM).install_rom(0x00400, 0x0f7ff, memregion("bios")->base());
 	m_maincpu->space(AS_PROGRAM).install_writeonly(0x00400, 0x0f7ff,
 			reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x400);
-	m_maincpu->space(AS_PROGRAM).install_rom(0x10000, 0x103ff, memregion("bios")->base() + 0xfc00);
+	// The overlay wraps at 64K: physical 0x1000D reads ROM offset 0x0D,
+	// not 0xFC0D. Two earlier revisions got this wrong - mirroring ROM
+	// 0xfc00 there put the middle of the LCD font under the retf
+	// 1000:000D at the end of the vector-install path (font bytes
+	// happened to limp along for 445k instructions), and plain RAM put
+	// zeros there. The real target is the stub table again: ROM 0x0D is
+	// jcxz followed by jmp far E17A:01AD, the disk service entry - push
+	// all, take the lock at [1128], pick one of two unit blocks at
+	// [112D]/[114C]. That call is the boot read.
+	m_maincpu->space(AS_PROGRAM).install_rom(0x10000, 0x103ff, memregion("bios")->base());
 	m_maincpu->space(AS_PROGRAM).install_writeonly(0x10000, 0x103ff,
 			reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x10000);
 	m_boot_mirror = true;
