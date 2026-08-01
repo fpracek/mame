@@ -297,6 +297,17 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		return m_uart->ins8250_r(reg & 7);
 	}
 
+	// Configuration word. The 1986 BIOS forks on bit 13 right after
+	// reset (F0012: test aw,2000h): set, it takes the burn-in path at
+	// F07C4 that programs the LCD controller and deliberately powers
+	// the machine down; clear, it runs the customer POST at F001A -
+	// video RAM test, then the message writer that prints
+	// "13 Power On Diagnostics" and the Rev 0.06 banner, matching the
+	// photographs of a real machine powering up. Return the word with
+	// bit 13 clear.
+	if ((offset << 1) == 0x2b0a)
+		return 0xdfff;
+
 	// Console status, read by the timer-tick device poller at E11C5 as
 	// port (selector << 8) | 0x62 with the console's selector 0x10. The
 	// poller rotates bit 0 up to bit 7 and treats it as offline/busy:
@@ -594,7 +605,22 @@ void wltc_state::machine_reset()
 	m_legacy_bios = (bios[0] == 0xff && bios[1] == 0xff);   // E half blank: 64K image
 	if (m_legacy_bios)
 	{
-		std::fill_n(&m_shadow[0], 0x8000, 0);
+		// The customer POST migrates itself from segment F000 to E000
+		// through a trampoline in low RAM: out 0x2d02, 0x1e, then a
+		// far return to the same offset with CS=E000. The 64K EPROM
+		// image therefore decodes in both segments; mirror it into the
+		// E area.
+		memcpy(m_shadow, memregion("bios")->base() + 0x10000, 0x10000);
+
+		// And the reason it moves: segment F is shadow RAM on this
+		// hardware. Once running from E, the POST pattern-tests
+		// F000:0000-0FFF destructively (AAAA/5555 at E0225-E0240) and
+		// fails onto the error/halt path if the readback comes from
+		// EPROM. Back the whole segment with RAM preloaded from the
+		// image.
+		uint8_t *const fram = reinterpret_cast<uint8_t *>(m_fram.target());
+		memcpy(fram, memregion("bios")->base() + 0x10000, 0x10000);
+		m_maincpu->space(AS_PROGRAM).install_ram(0xf0000, 0xfffff, fram);
 		return;
 	}
 
