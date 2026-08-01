@@ -588,13 +588,24 @@ void wltc_state::machine_reset()
 	// writes across low memory. Entry state, again, not a missing
 	// device.
 	//
-	// Where the glyphs are meant to live is now known: the init picks
-	// BX = 0x0700 or 0x2000 at E4D6A/E4D72 depending on bit 6 of the
-	// descriptor, and E5751 reads the same 0x0700 back out of the code
-	// with mov es,cs:[0x14b]. So the character generator is read from
-	// RAM at 0x07000 (or 0x20000), not from the EPROM - something has to
-	// put the font there first, and nothing in this flow does. That is
-	// why the panel fills with structure rather than glyphs.
+	// Where the glyphs are meant to live is now known, and it is not the
+	// EPROM. The data template holds two character-generator segments at
+	// E35F:0006 and E35F:000A - 0x1298 and 0x1398, so 0x12980 and
+	// 0x13980 - and the display setup at EF478 picks between them on bit
+	// 7 of port 0x2e1e, the display-type bit. From there EF572 copies a
+	// kilobyte out of 1398:0000 into F000:FA6E, which is the 128-entry
+	// eight-bytes-per-glyph table that the reverse lookup at E5751
+	// searches, and EF4D0 and E5904 expand the same font into video
+	// memory at F200:0000.
+	//
+	// Neither 0x1298 nor 0x1398 appears as an immediate anywhere in the
+	// 128K, so nothing in the EPROM ever loads a font there: it arrives
+	// from disk, which fits a BIOS whose own error text says it needs
+	// MSDOS320.SYS. The EPROM does carry an 8x16 font of its own at ROM
+	// 0xf5d1 - 'A', 'B' and '0' render correctly out of it - but no code
+	// copies that to 0x13980 either. Until something does, the expanders
+	// read empty RAM, which is why the panel fills with structure rather
+	// than glyphs.
 	//
 	// A third shape, selectable with the config switch, enters the same
 	// body with CS=E35F through a trampoline. Worth trying because the
