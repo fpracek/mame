@@ -604,6 +604,31 @@ void wltc_state::machine_reset()
 	// EPROMs; the F segment stays ROM for reads.
 	memcpy(m_shadow, bios, 0x10000);
 
+	// The data template carries runtime state frozen into the EPROM
+	// image: the console descriptor at E35F:3A03 holds a pending
+	// retransmit character 0x44 with nine retries left, and its ring
+	// buffer at E35F:3B34 has a write index of 3 over three stale bytes.
+	// On hardware these fields live in freshly initialised RAM; give
+	// the shadow copy the same start.
+	//
+	// Where the screen text actually comes from, measured with a write
+	// tap on the buffer: the status line - row 24, which holds the
+	// " - BIOS 4.02.03" tail - is written directly by the driver's
+	// character routine at E4E06, and the clear at E502B wipes rows
+	// 0-23 only, sparing it: rows 0-23 are the scrollable screen, row
+	// 24 the status line. "Wang LapTop Computer", the first message,
+	// never reaches the buffer and never leaves port 0x2a08 either: its
+	// delivery path (the tail of the printer at E14A6, past the wait)
+	// is still unmapped.
+	{
+		uint8_t *const sh = reinterpret_cast<uint8_t *>(m_shadow.target());
+		sh[0x35f0 + 0x3a03 + 0x16] = 0;              // pending char
+		sh[0x35f0 + 0x3a03 + 0x17] = 0;              // retry counter
+		for (int i = 2; i < 10; i++)                 // ring indexes
+			sh[0x35f0 + 0x3b34 + i] = 0;
+	}
+
+
 	// Boot overlay: reads come from the EPROM mirrored at 0x400, writes
 	// go through to the RAM underneath (the ES=0 clear that zeroes the
 	// BDA/IVT area is intentional - it initializes the low data area,
