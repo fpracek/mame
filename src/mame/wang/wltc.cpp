@@ -36,6 +36,7 @@
 
 #include "emu.h"
 #include "cpu/nec/nec.h"
+#include "machine/pit8253.h"
 #include "machine/timer.h"
 #include "screen.h"
 
@@ -48,6 +49,7 @@ public:
 	wltc_state(const machine_config &mconfig, device_type type, const char *tag) :
 		driver_device(mconfig, type, tag),
 		m_maincpu(*this, "maincpu"),
+		m_pit(*this, "pit"),
 		m_shadow(*this, "shadow"),
 		m_lowram(*this, "lowram"),
 		m_fram(*this, "fram")
@@ -60,6 +62,7 @@ protected:
 
 private:
 	required_device<v30_device> m_maincpu;
+	required_device<pit8254_device> m_pit;
 	required_shared_ptr<uint16_t> m_shadow;
 	required_shared_ptr<uint16_t> m_lowram;
 	required_shared_ptr<uint16_t> m_fram;
@@ -180,6 +183,13 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	if (!machine().side_effects_disabled())
 		logerror("%06x: io_r %04x mask %04x\n", m_maincpu->pc(), offset << 1, mem_mask);
 
+	// D71054 programmable interval timer (8254 clone) at 0x2400-0x2406,
+	// one register every other address: the diagnostic utility programs
+	// it with the classic control words (0x74 counter 1 mode 2, 0xb6
+	// counter 2 mode 3) followed by a 16-bit divisor, LSB then MSB.
+	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
+		return m_pit->read((offset >> 1) & 3);
+
 	// Reads of the boot overlay switch to the underlying RAM at the
 	// port 0x200 read inside the relocation walk: all ROM-sourced
 	// pipeline reads are done by then.
@@ -223,6 +233,12 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
 	logerror("%06x: io_w %04x = %04x mask %04x\n", m_maincpu->pc(), offset << 1, data, mem_mask);
+
+	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
+	{
+		m_pit->write((offset >> 1) & 3, data & 0xff);
+		return;
+	}
 
 	// index register of the clock/scratch device, and its data port
 	if ((offset << 1) == 0x2c00)
@@ -405,6 +421,14 @@ void wltc_state::wltc(machine_config &config)
 	m_maincpu->set_addrmap(AS_PROGRAM, &wltc_state::mem_map);
 	m_maincpu->set_addrmap(AS_IO, &wltc_state::io_map);
 	m_maincpu->set_irq_acknowledge_callback(FUNC(wltc_state::irq_ack));
+
+	// NEC D71054, an 8254 clone, at 0x2400-0x2406 (one register every
+	// other address); the counters are clocked from the CPU crystal
+	// through the usual divider chain.
+	PIT8254(config, m_pit);
+	m_pit->set_clk<0>(8_MHz_XTAL / 4);
+	m_pit->set_clk<1>(8_MHz_XTAL / 4);
+	m_pit->set_clk<2>(8_MHz_XTAL / 4);
 
 	TIMER(config, "tick").configure_periodic(FUNC(wltc_state::tick), attotime::from_hz(1000));
 
