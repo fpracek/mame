@@ -52,8 +52,9 @@
 #include <deque>
 
 
-// The driver's own SCSI drive, defined at the bottom of this file
+// The driver's own SCSI devices, defined at the bottom of this file
 extern emu::detail::device_type_impl<nscsi_harddisk_device> const WANG_WINCHESTER;
+extern emu::detail::device_type_impl<nscsi_full_device> const WANG_SCSI_FLOPPY;
 
 namespace {
 
@@ -126,6 +127,113 @@ static void wltc_floppies(device_slot_interface &device)
 {
 	device.option_add("525dd", FLOPPY_525_DD);
 }
+
+// ---------------------------------------------------------------------
+// The external floppy drive, which hangs off the SCSI bus at ID 1 - the
+// maintenance manual's remedies for "won't load diagnostic diskette" are
+// to check the FDD's SCSI cable and its SCSI PCB, and the start-up code's
+// drive A leg selects ID 1 and gives up when nothing answers.
+//
+// It does not speak plain SCSI. The ROM keeps its command blocks in a
+// table at FC00:2500, eight bytes each - three of header, "00 <length>
+// 00", then five of CDB with a sixth implied zero - and among the
+// ordinary opcodes there are four the standard does not define:
+//
+//     01 00 00 00 00 00    rezero unit
+//     00 00 00 00 00 00    test unit ready
+//     03 00 00 00 0c 00    request sense, allocation 12
+//     a2 00 03 00 00 00    vendor
+//     a1 00 03 nn 00 00    vendor, nn = 00, 01, 02 or 03
+//
+// plus an a0 built elsewhere, seen on the bus as a0 00 05 30 07 00.
+// Opcodes from 0xa0 up would normally carry a twelve byte CDB; Wang
+// sends six.
+//
+// This is a listening post, not a drive: it answers what it can and logs
+// every command block so the firmware can say what the rest mean.
+// ---------------------------------------------------------------------
+class wang_scsi_floppy_device : public nscsi_full_device
+{
+public:
+	wang_scsi_floppy_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0)
+		: nscsi_full_device(mconfig, WANG_SCSI_FLOPPY, tag, owner, clock)
+	{ }
+
+protected:
+	virtual void device_reset() override ATTR_COLD
+	{
+		nscsi_full_device::device_reset();
+		m_unit_attention = true;
+	}
+
+	// the vendor opcodes come as six byte blocks, not the twelve their
+	// group code would normally mean
+	virtual bool scsi_command_done(uint8_t command, uint8_t length) override
+	{
+		// Six, not the twelve their group code would normally mean.
+		// Byte 2 carries a length of its own - FCE82 builds the block
+		// with the byte count of the floppy command it is forwarding -
+		// but taking that as the CDB length leaves a byte on the bus and
+		// the next command never arrives, so the frame is six and byte 2
+		// counts something inside it.
+		if (command >= 0xa0 && command <= 0xa2)
+			return length == 6;
+		return nscsi_full_device::scsi_command_done(command, length);
+	}
+
+	virtual void scsi_command() override
+	{
+		std::string cdb;
+		for (int i = 0; i < m_scsi_cmdsize; i++)
+			cdb += util::string_format(" %02x", m_scsi_cmdbuf[i]);
+		logerror("drive A comando:%s\n", cdb);
+
+		switch (m_scsi_cmdbuf[0])
+		{
+		case SC_TEST_UNIT_READY:
+			scsi_status_complete(SS_GOOD);
+			return;
+
+		case SC_REQUEST_SENSE:
+		{
+			// the same SCSI-1 shape the Winchester answers with
+			std::fill(std::begin(m_scsi_sense_buffer), std::end(m_scsi_sense_buffer), 0);
+			m_scsi_sense_buffer[0] = 0x70;
+			m_scsi_sense_buffer[7] = 8;
+			if (m_unit_attention)
+			{
+				m_scsi_sense_buffer[2] = SK_UNIT_ATTENTION;
+				m_scsi_sense_buffer[12] = 0x29;
+				m_unit_attention = false;
+			}
+			int const alloc = m_scsi_cmdbuf[4];
+			scsi_data_in(SBUF_SENSE, std::min(16, alloc ? alloc : 4));
+			scsi_status_complete(SS_GOOD);
+			return;
+		}
+
+		case 0x01: // rezero unit
+			m_unit_attention = false;
+			scsi_status_complete(SS_GOOD);
+			return;
+
+		case 0xa0:
+		case 0xa1:
+		case 0xa2:
+			// meaning unknown. Answer with a good status and no data and
+			// see what the firmware does next - if it wants data it will
+			// stall in the data phase and say so.
+			m_unit_attention = false;
+			scsi_status_complete(SS_GOOD);
+			return;
+		}
+
+		nscsi_full_device::scsi_command();
+	}
+
+private:
+	bool m_unit_attention = true;
+};
 
 class wltc_state : public driver_device
 {
@@ -1603,7 +1711,12 @@ void wltc_state::wltc(machine_config &config)
 	nscsi_connector &winchester(NSCSI_CONNECTOR(config, "scsi:0"));
 	winchester.option_add("winchester", WANG_WINCHESTER);
 	winchester.set_default_option("winchester");
-	NSCSI_CONNECTOR(config, "scsi:1", default_scsi_devices, nullptr);
+	// The external floppy drive, drive A. Not fitted by default: it is
+	// still a listening post rather than a drive, and the start-up code
+	// tries drive A before anything else, so fitting it takes priority
+	// away from the paths that do work. Enable it with -scsi:1 wangfdd.
+	nscsi_connector &fdd(NSCSI_CONNECTOR(config, "scsi:1"));
+	fdd.option_add("wangfdd", WANG_SCSI_FLOPPY);
 	NCR5380(config, m_scsi);
 	scsibus.set_external_device(7, m_scsi);
 	m_scsi->irq_handler().set(m_pic, FUNC(pic8259_device::ir5_w));
@@ -1711,6 +1824,7 @@ ROM_END
 } // anonymous namespace
 
 DEFINE_DEVICE_TYPE_PRIVATE(WANG_WINCHESTER, nscsi_harddisk_device, wang_winchester_device, "wang_winchester", "Wang LapTop Winchester")
+DEFINE_DEVICE_TYPE_PRIVATE(WANG_SCSI_FLOPPY, nscsi_full_device, wang_scsi_floppy_device, "wang_scsi_floppy", "Wang LapTop external floppy drive")
 
 
 //    YEAR  NAME  PARENT  COMPAT  MACHINE  INPUT  CLASS       INIT        COMPANY              FULLNAME               FLAGS
