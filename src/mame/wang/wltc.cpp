@@ -166,17 +166,19 @@ protected:
 	{
 		nscsi_full_device::device_reset();
 		m_unit_attention = true;
-		// the drive spins whenever it has a disk in it - nothing in the
-		// command set switches a motor
-		// no set_floppy(): the controller is configured with its select
-		// lines connected, so it picks the drive from the unit bits of
-		// the command itself
-		floppy_image_device *const f = m_drive->get_device();
-		if (f)
-			f->mon_w(0);
-		logerror("drive A: unita' %s, supporto %s\n",
-				f ? "presente" : "assente",
-				(f && f->exists()) ? "inserito" : "assente");
+		// No set_floppy(): the controller has its select lines connected,
+		// so it picks the drive from the unit bits of the command.
+		//
+		// The drive spins from the moment the enclosure is powered -
+		// nothing in the command set switches a motor - but not from in
+		// here. floppy_image_device's own reset puts its motor line back
+		// and declares itself not ready, and the order between sibling
+		// resets is not ours to choose. A moment later is safely after
+		// it, and leaves room for the two index revolutions the drive
+		// counts before reporting ready: starting the motor just before
+		// a command, as this used to, gave it none, and every command
+		// came back with the not-ready bit set.
+		m_spin->adjust(attotime::zero);
 	}
 
 	// the vendor opcodes come as six byte blocks, not the twelve their
@@ -253,10 +255,6 @@ protected:
 					m_expected = (eot - r + 1) * (128 << sz);
 			}
 			m_fdc->tc_w(false);
-			// keep it spinning: the drive's own reset may have parked it
-			// after ours ran
-			if (floppy_image_device *const f = m_drive->get_device())
-				f->mon_w(0);
 			for (int i = 0; i < len; i++)
 				m_fdc->fifo_w(m_scsi_cmdbuf[4 + i]);
 			// specify neither interrupts nor leaves a result phase, so
@@ -293,6 +291,7 @@ protected:
 	{
 		nscsi_full_device::device_start();
 		m_drain = timer_alloc(FUNC(wang_scsi_floppy_device::drain), this);
+		m_spin = timer_alloc(FUNC(wang_scsi_floppy_device::spin_up), this);
 		save_item(NAME(m_unit_attention));
 		save_item(NAME(m_fdc_command));
 		save_item(NAME(m_expected));
@@ -323,6 +322,16 @@ private:
 		// rates.
 		if (state)
 			m_drain->adjust(attotime::zero);
+	}
+
+	TIMER_CALLBACK_MEMBER(spin_up)
+	{
+		floppy_image_device *const f = m_drive->get_device();
+		if (f)
+			f->mon_w(0);
+		logerror("drive A: unita' %s, supporto %s\n",
+				f ? "presente" : "assente",
+				(f && f->exists()) ? "inserito" : "assente");
 	}
 
 	TIMER_CALLBACK_MEMBER(drain)
@@ -367,6 +376,7 @@ private:
 	required_device<upd765a_device> m_fdc;
 	required_device<floppy_connector> m_drive;
 	emu_timer *m_drain = nullptr;
+	emu_timer *m_spin = nullptr;
 	std::vector<uint8_t> m_data;
 	int m_expected = 0;
 	uint8_t m_fdc_command = 0;
