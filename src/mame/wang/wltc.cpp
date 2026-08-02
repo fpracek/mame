@@ -395,19 +395,25 @@ private:
 		case 0x06: m_dma_addr = (m_dma_addr & 0x0ffff) | ((data & 0x0f) << 16); break;
 		case 0x0a:
 			m_dma_go = BIT(data, 2);
-			logerror("DMA command %02x: %s, %d bytes at %05x\n", data,
-					m_dma_recv ? "read" : "write",
-					m_dma_count + 1, m_dma_addr);
+			// the disk driver writes the command before the address and
+			// the count, so there is nothing worth printing here yet
+			logerror("DMA command %02x\n", data);
 			dma_service();
 			break;
 		case 0x0f:
-			// bit 1 is the channel mask, cleared at F118D to let the
-			// transfer run and set again by the ISR on the way out
+			// the channel mask; a clear bit lets that channel run
 			dma_service();
 			break;
 		}
 	}
-	bool dma_armed() const { return m_dma_go && !BIT(m_dma_reg[0x0f], 1); }
+	// 0x230f masks channels, one bit each, and the bit for this one is
+	// bit 0. The POST's driver hides that behind a literal - F118D just
+	// ands 0xfd - but the disk driver computes it: FCE57 reads 0x2301,
+	// the byte that names the channel, inverts it and ands that into
+	// 0x230f. With 0x2301 = 1 it is bit 0 that gets cleared, and bit 0
+	// is what both drivers leave low before starting a transfer (0x0c
+	// from the POST, 0x0e from the disk driver).
+	bool dma_armed() const { return m_dma_go && !BIT(m_dma_reg[0x0f], 0); }
 	void dma_drq_w(int state)
 	{
 		m_dma_drq = state;
@@ -746,9 +752,18 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		return 0x0044; // handshake status, bit7 = busy, measured idle
 	case 0x2b02:
 		// keyboard/console channel status: bit 0 ready to accept a
-		// byte, bit 1 a byte waiting to be read
+		// byte, bit 1 a byte waiting to be read.
+		//
+		// The rest of the byte is not the console's. Bit 3 says whether
+		// a second floppy drive is attached: the start-up loop tries
+		// drive A, drive B and then the Winchester in turn, and its
+		// drive B leg at FC3B8 reads this port and returns if bit 3 is
+		// high. Idle on the real machine this port reads 0xfc - bit 3
+		// high, no drive B - so returning the console bits alone left
+		// every other line low and the machine kept trying to start from
+		// a drive that is not there.
 		if (m_legacy_bios)
-			return m_kb_status;
+			return 0xfc | m_kb_status;
 		return 0x00fe; // measured 0xfc idle; bit1 (ready to accept) forced high
 	case 0x2e1e: return 0x00f4; // mode/config register, measured on real hardware:
 	                            // 0xf4 in Wang mode, 0xfc in Industry Standard mode
@@ -812,6 +827,16 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		else
 			m_maincpu->space(AS_PROGRAM).install_ram(0xf0000, 0xfffff,
 					reinterpret_cast<uint8_t *>(m_fram.target()));
+	}
+
+	// End-of-interrupt for the DMA source, and with it the terminal
+	// count flag in 0x2b0a. The disk driver's handler at FD31E reads
+	// that word, strobes this port and reads the word again in a loop,
+	// so the strobe has to take the flag down.
+	if ((offset << 1) == 0x2c12)
+	{
+		m_dma_tc = false;
+		return;
 	}
 
 	// Interrupt vector base register - see m_vector_base
