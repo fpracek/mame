@@ -218,11 +218,49 @@ protected:
 			return;
 
 		case 0xa0:
+		{
+			// A floppy-controller command, forwarded. The reply frame is
+			// dictated by FD1E2, which is what unpacks it: the first byte
+			// must be 1, the second is the result count plus three, and
+			// the result bytes themselves start five in. The block that
+			// receives it insists on at least seven bytes.
+			m_unit_attention = false;
+			uint8_t res[8];
+			int n = 0;
+			switch (m_scsi_cmdbuf[4])
+			{
+			case 0x03: // specify - no result phase on a 765 either
+				break;
+			case 0x07: // recalibrate
+			case 0x0f: // seek
+			case 0x08: // sense interrupt status
+				res[n++] = 0x20;               // seek end
+				res[n++] = 0x00;               // present cylinder
+				break;
+			case 0x4a: // read id
+				res[n++] = 0x00;               // st0
+				res[n++] = 0x00;               // st1
+				res[n++] = 0x00;               // st2
+				res[n++] = 0x00;               // cylinder
+				res[n++] = 0x00;               // head
+				res[n++] = 0x01;               // sector
+				res[n++] = 0x02;               // 512 bytes a sector
+				break;
+			}
+			int const len = std::max(7, 5 + n);
+			std::fill_n(m_scsi_cmdbuf, len, 0);
+			m_scsi_cmdbuf[0] = 0x01;
+			m_scsi_cmdbuf[1] = n + 3;
+			for (int i = 0; i < n; i++)
+				m_scsi_cmdbuf[5 + i] = res[i];
+			scsi_data_in(SBUF_MAIN, len);
+			scsi_status_complete(SS_GOOD);
+			return;
+		}
+
 		case 0xa1:
 		case 0xa2:
-			// meaning unknown. Answer with a good status and no data and
-			// see what the firmware does next - if it wants data it will
-			// stall in the data phase and say so.
+			// still unread. Good status, no data.
 			m_unit_attention = false;
 			scsi_status_complete(SS_GOOD);
 			return;
