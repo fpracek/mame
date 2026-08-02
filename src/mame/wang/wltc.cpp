@@ -220,6 +220,13 @@ protected:
 			cdb += util::string_format(" %02x", m_scsi_cmdbuf[i]);
 		logerror("drive A comando:%s\n", cdb);
 
+		// A read whose data phase the host walked away from - the normal
+		// case, since the sector count is a maximum - leaves the sending
+		// flag up, and the next command that answers out of the main
+		// buffer gets served leftover sector bytes instead. The inquiry
+		// came back as two bytes of the previous track.
+		m_sending = false;
+
 		switch (m_scsi_cmdbuf[0])
 		{
 		case SC_TEST_UNIT_READY:
@@ -248,6 +255,87 @@ protected:
 			m_unit_attention = false;
 			scsi_status_complete(SS_GOOD);
 			return;
+
+		case SC_INQUIRY:
+		{
+			// Asked for once, with room for 36 bytes; a plain SCSI-1
+			// answer, removable direct-access.
+			int const alloc = m_scsi_cmdbuf[4];
+			std::fill_n(m_scsi_cmdbuf, 36, 0);
+			m_scsi_cmdbuf[1] = 0x80;    // removable
+			m_scsi_cmdbuf[2] = 0x01;    // SCSI-1
+			m_scsi_cmdbuf[3] = 0x01;    // and its inquiry format
+			m_scsi_cmdbuf[4] = 31;      // additional length
+			std::memcpy(&m_scsi_cmdbuf[8],  "WANG    ", 8);
+			std::memcpy(&m_scsi_cmdbuf[16], "FDD             ", 16);
+			std::memcpy(&m_scsi_cmdbuf[32], "1.00", 4);
+			scsi_data_in(SBUF_MAIN, std::min<int>(36, alloc ? alloc : 4));
+			scsi_status_complete(SS_GOOD);
+			return;
+		}
+
+		case SC_MODE_SENSE_6:
+		{
+			// The start-up code asks for page 4 with room for 19 bytes and
+			// reads the geometry straight out of the classic layout: at
+			// E66BC it takes the big-endian word at offset 15/16 (the low
+			// half of the three-byte cylinder count) minus two, and the
+			// byte at 17 as the head count, then works out the capacity as
+			// (cylinders - 2) * heads * 16. So the four-byte header and the
+			// eight-byte block descriptor both have to be there, whatever
+			// the page.
+			int const alloc = m_scsi_cmdbuf[4];
+			int const page = m_scsi_cmdbuf[2] & 0x3f;
+			floppy_image_device *const fd = m_drive->get_device();
+			int const heads = (fd && fd->get_sides()) ? fd->get_sides() : 2;
+			int cylinders = 40, sectors = 9;
+			if (fd)
+				switch (fd->get_variant())
+				{
+				case floppy_image::DSQD: cylinders = 80; break;
+				case floppy_image::DSHD: cylinders = 80; sectors = 15; break;
+				default: break;
+				}
+			uint32_t const blocks = uint32_t(cylinders) * heads * sectors;
+
+			uint8_t buf[36];
+			std::fill_n(buf, sizeof(buf), 0);
+			buf[1] = 0;                 // medium type
+			buf[2] = (fd && fd->wpt_r()) ? 0x80 : 0x00;
+			buf[3] = 8;                 // block descriptor length
+			buf[5] = (blocks >> 16) & 0xff;
+			buf[6] = (blocks >> 8) & 0xff;
+			buf[7] = blocks & 0xff;
+			buf[10] = 0x02;             // 512 byte blocks
+			int len = 12;
+			if (page == 0x04 || page == 0x3f)
+			{
+				buf[len + 0] = 0x04;
+				buf[len + 1] = 0x16;
+				buf[len + 3] = (cylinders >> 8) & 0xff;
+				buf[len + 4] = cylinders & 0xff;
+				buf[len + 5] = heads;
+				len += 24;
+			}
+			else if (page == 0x01)
+			{
+				buf[len + 0] = 0x01;
+				buf[len + 1] = 0x0a;
+				len += 12;
+			}
+			else
+			{
+				scsi_status_complete(SS_CHECK_CONDITION);
+				sense(false, SK_ILLEGAL_REQUEST);
+				return;
+			}
+			buf[0] = len - 1;
+			m_unit_attention = false;
+			std::copy_n(buf, len, m_scsi_cmdbuf);
+			scsi_data_in(SBUF_MAIN, std::min<int>(len, alloc ? alloc : 4));
+			scsi_status_complete(SS_GOOD);
+			return;
+		}
 
 		case 0xa0:
 		{
