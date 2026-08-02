@@ -36,20 +36,85 @@
 
 #include "emu.h"
 #include "cpu/nec/nec.h"
-#include "machine/am9517a.h"
 #include "machine/ins8250.h"
 #include "machine/pic8259.h"
 #include "machine/pit8253.h"
 #include "machine/ncr5380.h"
 #include "machine/z80scc.h"
 #include "bus/nscsi/devices.h"
+#include "bus/nscsi/hd.h"
 #include "machine/timer.h"
 #include "screen.h"
 
 #include <deque>
 
 
+// The driver's own SCSI drive, defined at the bottom of this file
+extern emu::detail::device_type_impl<nscsi_harddisk_device> const WANG_WINCHESTER;
+
 namespace {
+
+// ---------------------------------------------------------------------
+// The Winchester drive.
+//
+// The POST's SCSI Winchester Command Test resets the bus, issues a
+// six-byte REQUEST SENSE with an allocation length of sixteen and
+// compares the sixteen bytes that come back, one for one, against a
+// reference image the ROM carries at 0000:08B9:
+//
+//     70 00 06 00 00 00 00 08 00 00 00 00 29 00 00 00
+//
+// That reference is a specification of the drive, written by the people
+// who shipped it, and it says two things a generic MAME hard disk does
+// not do. The sense key is UNIT ATTENTION (6) with additional sense code
+// 0x29, "power on, reset or bus device reset occurred" - mandatory SCSI
+// behaviour on the first command after a reset, which nscsi_full_device
+// never reports. And the additional sense length is 8, not the 10 of the
+// SCSI-2 eighteen-byte response: this is a SCSI-1 drive, and sixteen
+// bytes is its whole extended sense. Byte 0 is 0x70, so the information
+// field is not valid.
+// ---------------------------------------------------------------------
+class wang_winchester_device : public nscsi_harddisk_device
+{
+public:
+	wang_winchester_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0)
+		: nscsi_harddisk_device(mconfig, WANG_WINCHESTER, tag, owner, clock)
+	{ }
+
+protected:
+	virtual void device_reset() override ATTR_COLD
+	{
+		nscsi_harddisk_device::device_reset();
+		m_unit_attention = true;
+	}
+	virtual void scsi_command() override
+	{
+		if (m_scsi_cmdbuf[0] != SC_REQUEST_SENSE)
+		{
+			// any other command clears the condition without reporting
+			// it, which is all the POST needs of the rest of the set
+			m_unit_attention = false;
+			nscsi_harddisk_device::scsi_command();
+			return;
+		}
+
+		std::fill(std::begin(m_scsi_sense_buffer), std::end(m_scsi_sense_buffer), 0);
+		m_scsi_sense_buffer[0] = 0x70;
+		m_scsi_sense_buffer[7] = 8;
+		if (m_unit_attention)
+		{
+			m_scsi_sense_buffer[2] = SK_UNIT_ATTENTION;
+			m_scsi_sense_buffer[12] = 0x29;
+			m_unit_attention = false;
+		}
+		int const alloc = m_scsi_cmdbuf[4];
+		scsi_data_in(SBUF_SENSE, std::min(16, alloc ? alloc : 4));
+		scsi_status_complete(SS_GOOD);
+	}
+
+private:
+	bool m_unit_attention = true;
+};
 
 class wltc_state : public driver_device
 {
@@ -58,7 +123,6 @@ public:
 		driver_device(mconfig, type, tag),
 		m_maincpu(*this, "maincpu"),
 		m_pit(*this, "pit"),
-		m_dmac(*this, "dmac"),
 		m_pic(*this, "pic"),
 		m_uart(*this, "uart"),
 		m_scc(*this, "scc"),
@@ -86,7 +150,6 @@ protected:
 private:
 	required_device<v30_device> m_maincpu;
 	required_device<pit8254_device> m_pit;
-	required_device<am9517a_device> m_dmac;
 	required_device<pic8259_device> m_pic;
 	required_device<ins8250_device> m_uart;
 	required_device<scc8530_device> m_scc;
@@ -200,6 +263,16 @@ private:
 	uint8_t const *m_chargen = nullptr;
 	emu_timer *m_rtc_timer = nullptr;
 
+	// Wang DMA controller state - see dma_reg_w
+	uint8_t m_dma_reg[16] = {
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+	uint32_t m_dma_addr = 0;
+	uint16_t m_dma_count = 0;
+	bool m_dma_go = false;
+	bool m_dma_tc = false;
+	bool m_dma_drq = false;
+	bool m_dma_recv = true;
+
 	// Keyboard/console microcontroller. It talks over a two-way byte
 	// channel: status at 0x2b02 (bit 0 ready to accept a byte, bit 1 a
 	// byte waiting to be read), data both ways at 0x2a08, acknowledge
@@ -265,6 +338,86 @@ private:
 		if (m_legacy_bios && state && !BIT(m_int_enable_2202, N - 1))
 		{
 			m_gate_vector = 0x20 + (N - 1);
+			m_maincpu->set_input_line(0, HOLD_LINE);
+		}
+	}
+	// ---------------------------------------------------------------
+	// Wang DMA controller (0x2300-0x230f)
+	//
+	// Not an 8237. F12C8 programs it for the SCSI read and gives the
+	// whole layout away:
+	//     0x2300 = 0x02, 0x2301 = 0x01   two mode bytes
+	//     0x2302 = word, transfer count minus one
+	//     0x2304 = word, physical address bits 15:0
+	//     0x2306 = byte, physical address bits 19:16
+	//     0x230a = command, 0x44 to run   (0x18 in the self test at
+	//              F0375, which programs a count but never transfers -
+	//              hence reading bit 2 as the go bit)
+	//     0x230b = read to acknowledge the terminal count
+	//     0x230f = bit 1 masks the channel: F118D clears it to let the
+	//              transfer run, the ISR sets it again on the way out
+	// End of transfer raises vector 0x23, whose handler F1304 installs
+	// at F000:1338 before clearing bit 3 of 0x2202 to unmask it. That
+	// handler reads 0x2b0a to find out why it was called and sets bit 7
+	// of BP when bit 5 says the count expired - which is the one thing
+	// the wait loop at F1244 tests before declaring the transfer done.
+	// ---------------------------------------------------------------
+	void dma_reg_w(int reg, uint8_t data)
+	{
+		m_dma_reg[reg & 0x0f] = data;
+		switch (reg & 0x0f)
+		{
+		case 0x02: m_dma_count = (m_dma_count & 0xff00) | data; break;
+		case 0x03: m_dma_count = (m_dma_count & 0x00ff) | (data << 8); break;
+		case 0x04: m_dma_addr = (m_dma_addr & 0xfff00) | data; break;
+		case 0x05: m_dma_addr = (m_dma_addr & 0xf00ff) | (data << 8); break;
+		case 0x06: m_dma_addr = (m_dma_addr & 0x0ffff) | ((data & 0x0f) << 16); break;
+		case 0x0a:
+			m_dma_go = BIT(data, 2);
+			logerror("DMA command %02x: %s, %d bytes at %05x\n", data,
+					m_dma_recv ? "read" : "write",
+					m_dma_count + 1, m_dma_addr);
+			dma_service();
+			break;
+		case 0x0f:
+			// bit 1 is the channel mask, cleared at F118D to let the
+			// transfer run and set again by the ISR on the way out
+			dma_service();
+			break;
+		}
+	}
+	bool dma_armed() const { return m_dma_go && !BIT(m_dma_reg[0x0f], 1); }
+	void dma_drq_w(int state)
+	{
+		m_dma_drq = state;
+		if (state)
+			dma_service();
+	}
+	void dma_service()
+	{
+		address_space &space = m_maincpu->space(AS_PROGRAM);
+		while (dma_armed() && m_dma_drq)
+		{
+			if (m_dma_recv)
+				space.write_byte(m_dma_addr, m_scsi->dma_r());
+			else
+				m_scsi->dma_w(space.read_byte(m_dma_addr));
+			m_dma_addr = (m_dma_addr + 1) & 0xfffff;
+			if (m_dma_count-- == 0)
+				dma_complete();
+		}
+	}
+	void dma_complete()
+	{
+		m_dma_go = false;
+		m_dma_tc = true;
+		m_scsi->eop_w(1);
+		m_scsi->eop_w(0);
+		logerror("DMA complete, end address %05x\n", m_dma_addr);
+		// vector 0x23, unmasked by bit 3 of 0x2202 (active low)
+		if (m_legacy_bios && !BIT(m_int_enable_2202, 3))
+		{
+			m_gate_vector = 0x23;
 			m_maincpu->set_input_line(0, HOLD_LINE);
 		}
 	}
@@ -446,8 +599,15 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	// flags the timer ISRs sample into BP. Bits 12 and 11 are error
 	// latches the RTC test requires low - either one high sends it to
 	// the failure message before the tick counting even starts.
+	// Bit 5 is the DMA terminal-count flag. The vector 0x23 handler at
+	// F1338 reads this word and splits on it: bit 2 set means the 5380
+	// interrupted (it sets BP bit 4 and leaves), bit 5 set means the
+	// transfer finished (BP bit 7, which is the only thing the wait loop
+	// at F1244 ever tests). It has to be an event flag, not the constant
+	// it used to be here, or every SCSI interrupt would also report a
+	// completed transfer.
 	if ((offset << 1) == 0x2b0a)
-		return 0xc7fb | (m_scsi_rst_irq ? 0x0004 : 0);
+		return 0xc7db | (m_scsi_rst_irq ? 0x0004 : 0) | (m_dma_tc ? 0x0020 : 0);
 
 	// Console status, read by the timer-tick device poller at E11C5 as
 	// port (selector << 8) | 0x62 with the console's selector 0x10. The
@@ -493,13 +653,23 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	if ((offset << 1) == 0x20)
 		return m_pic->read((mem_mask & 0x00ff) ? 0 : 1);
 
-	// DMA controller at 0x2300-0x230f, byte addressed (registers run
-	// consecutively, odd addresses included - the diagnostic uses 0x230a
-	// as the single mask register and 0x230f as the all-mask one).
+	// Wang DMA controller at 0x2300-0x230f (see io_w for the layout)
 	if ((offset << 1) >= 0x2300 && (offset << 1) <= 0x230f)
 	{
-		int const reg = (offset << 1) - 0x2300 + ((mem_mask & 0x00ff) ? 0 : 1);
-		return m_dmac->read(reg & 0x0f);
+		switch (offset << 1)
+		{
+		case 0x2302: return m_dma_count;
+		case 0x2304: return m_dma_addr & 0xffff;
+		case 0x2306: return (m_dma_addr >> 16) & 0x0f;
+		case 0x230a:
+			// reading 0x230b acknowledges the terminal count - the ISR
+			// does it on the way out, after re-masking the channel
+			if (ACCESSING_BITS_8_15 && !machine().side_effects_disabled())
+				m_dma_tc = false;
+			break;
+		}
+		int const reg = (offset << 1) - 0x2300;
+		return m_dma_reg[reg] | (m_dma_reg[reg + 1] << 8);
 	}
 
 	// Reads of the boot overlay switch to the underlying RAM at the
@@ -637,6 +807,13 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		// the 5380 interrupt, visible in bit 2 of 0x2b0a
 		if ((offset & 7) == 1 && (data & 0x80) && !machine().side_effects_disabled())
 			m_scsi_rst_irq = true;
+		// the write-only registers 5 and 7 are the two "start DMA"
+		// strobes: 5 sends, 7 receives as initiator. They are what tells
+		// the Wang DMA controller which way the bytes are going - its own
+		// mode bytes are the same 0x02/0x01 pair on the read path we can
+		// see, so the direction has to come from this side.
+		if ((offset & 7) == 5) m_dma_recv = false;
+		if ((offset & 7) == 7) m_dma_recv = true;
 		m_scsi->write(offset & 7, data & 0xff);
 		return;
 	}
@@ -670,9 +847,9 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	{
 		int const reg = (offset << 1) - 0x2300;
 		if (ACCESSING_BITS_0_7)
-			m_dmac->write(reg & 0x0f, data & 0xff);
+			dma_reg_w(reg, data & 0xff);
 		if (ACCESSING_BITS_8_15)
-			m_dmac->write((reg + 1) & 0x0f, (data >> 8) & 0xff);
+			dma_reg_w(reg + 1, (data >> 8) & 0xff);
 		return;
 	}
 
@@ -1187,36 +1364,8 @@ void wltc_state::wltc(machine_config &config)
 	// NEC D71054, an 8254 clone, at 0x2400-0x2406 (one register every
 	// other address); the counters are clocked from the CPU crystal
 	// through the usual divider chain.
-	// 8237-compatible DMA controller at 0x2300-0x230f (byte addressed):
-	// the diagnostic programs channel addresses and counts there and
-	// masks channels through registers 0x0a and 0x0f before starting a
-	// transfer on the device at 0x2500.
-	AM9517A(config, m_dmac, 8_MHz_XTAL / 2);
-	m_dmac->in_memr_callback().set([this](offs_t offset) {
-		return m_maincpu->space(AS_PROGRAM).read_byte(offset); });
-	m_dmac->out_memw_callback().set([this](offs_t offset, uint8_t data) {
-		m_maincpu->space(AS_PROGRAM).write_byte(offset, data); });
-	// The controller has no separate bus arbiter here: loop its hold
-	// request straight back as an acknowledge, the usual arrangement
-	// when the DMA controller owns the bus by itself.
-	m_dmac->out_hreq_callback().set(m_dmac, FUNC(am9517a_device::hack_w));
-	// Channel 0 serves the SCSI controller: the disk read at F1186 puts
-	// the 5380 in DMA mode and starts an initiator receive, and without
-	// the request line and the data path the transfer never happens.
-	//
-	// This is not enough on its own, because the controller at
-	// 0x2300-0x230f is not an 8237 with byte-wide registers, which is
-	// what this am9517a stands in as. The BIOS programs a SCSI transfer
-	// as: word count 0x000f to 0x2302 - sixteen bytes, exactly the
-	// allocation length of the REQUEST SENSE it just sent - address
-	// 0x04b9 to 0x2304, a byte to 0x2306, then a command to 0x230a. An
-	// 8237 would take channel 0's address and count through registers 0
-	// and 1 with a byte flip-flop, so the Wang part has its own layout:
-	// count, address and page in separate 16-bit registers. Identifying
-	// it properly is what the Winchester command test is waiting for.
-	m_dmac->in_ior_callback<0>().set(m_scsi, FUNC(ncr5380_device::dma_r));
-	m_dmac->out_iow_callback<0>().set(m_scsi, FUNC(ncr5380_device::dma_w));
-	m_dmac->out_eop_callback().set(m_scsi, FUNC(ncr5380_device::eop_w));
+	// The DMA controller at 0x2300-0x230f is a Wang part, not an 8237,
+	// and is modelled in the driver itself - see dma_reg_w.
 
 	PIT8254(config, m_pit);
 	// 3.072 MHz: the POST timer test at F032B loads counter 0 with 2000
@@ -1256,12 +1405,14 @@ void wltc_state::wltc(machine_config &config)
 	// NCR 53C80 SCSI bus at 0x2700: the JVC Winchester sits on it, and
 	// so does the external floppy drive
 	nscsi_bus_device &scsibus(NSCSI_BUS(config, "scsi"));
-	NSCSI_CONNECTOR(config, "scsi:0", default_scsi_devices, "harddisk");
+	nscsi_connector &winchester(NSCSI_CONNECTOR(config, "scsi:0"));
+	winchester.option_add("winchester", WANG_WINCHESTER);
+	winchester.set_default_option("winchester");
 	NSCSI_CONNECTOR(config, "scsi:1", default_scsi_devices, nullptr);
 	NCR5380(config, m_scsi);
 	scsibus.set_external_device(7, m_scsi);
 	m_scsi->irq_handler().set(m_pic, FUNC(pic8259_device::ir5_w));
-	m_scsi->drq_handler().set(m_dmac, FUNC(am9517a_device::dreq0_w));
+	m_scsi->drq_handler().set(FUNC(wltc_state::dma_drq_w));
 
 	// Z8530APS serial communications controller at 0x2500
 	SCC8530(config, m_scc, 8_MHz_XTAL / 2);
@@ -1315,6 +1466,8 @@ ROM_START( wltc )
 ROM_END
 
 } // anonymous namespace
+
+DEFINE_DEVICE_TYPE_PRIVATE(WANG_WINCHESTER, nscsi_harddisk_device, wang_winchester_device, "wang_winchester", "Wang LapTop Winchester")
 
 
 //    YEAR  NAME  PARENT  COMPAT  MACHINE  INPUT  CLASS       INIT        COMPANY              FULLNAME               FLAGS
