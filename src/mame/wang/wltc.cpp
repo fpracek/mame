@@ -224,6 +224,24 @@ protected:
 			// must be 1, the second is the result count plus three, and
 			// the result bytes themselves start five in. The block that
 			// receives it insists on at least seven bytes.
+			//
+			// The firmware does follow a data-in phase here and reads
+			// exactly what is offered, but the reply never reaches the
+			// result bytes at 0x44e6: the descriptor at 0x453c - buffer
+			// pointer, segment, length, capacity - comes out of the
+			// transfer with a length of 1, and FD1E2 gives up on anything
+			// under seven. So something on that side has to be told how
+			// much to expect before this can be judged by its contents.
+			//
+			// What will judge it, once it arrives, is FCCA7 onwards: the
+			// sector size in the read id result must be 1, 2 or 3, and
+			// then the cylinder must read back as 4, 2 or 1 - the
+			// firmware seeks to a known track and infers the track
+			// density from the number that comes back, keeping the answer
+			// as a format index in [0x44ee]. Anything else is error 4,
+			// which is the "74 Format Error" on the screen. ST1 carrying
+			// a missing address mark, no data or a data error is the
+			// other way to earn it, at FCDC6.
 			m_unit_attention = false;
 			uint8_t res[8];
 			int n = 0;
