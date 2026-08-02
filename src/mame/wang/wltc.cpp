@@ -274,7 +274,10 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 			{
 				uint8_t const ch = tbuf[(row * 80) + (x >> 3)] & 0xff;
 				uint8_t const bits = m_chargen[(ch << 5) + (line << 1)];
-				*dst++ = BIT(bits, 7 - (x & 7)) ? fg : bg;
+				// bit 0 is the leftmost pixel, not bit 7: 'L' reads
+				// 0x06 on its upright rows and 'J' 0x78 on its top
+				// row - the other way round every glyph is mirrored
+				*dst++ = BIT(bits, x & 7) ? fg : bg;
 			}
 		}
 		return 0;
