@@ -43,6 +43,9 @@
 #include "machine/z80scc.h"
 #include "bus/nscsi/devices.h"
 #include "bus/nscsi/hd.h"
+#include "machine/upd765.h"
+#include "imagedev/floppy.h"
+#include "formats/pc_dsk.h"
 #include "machine/timer.h"
 #include "screen.h"
 
@@ -116,6 +119,14 @@ private:
 	bool m_unit_attention = true;
 };
 
+// The external floppy drive. The system diskettes are 368640 bytes with
+// a "Wang 3.0" boot record whose BPB reads 512 bytes a sector, nine
+// sectors a track, two heads - 40 cylinders of double density.
+static void wltc_floppies(device_slot_interface &device)
+{
+	device.option_add("525dd", FLOPPY_525_DD);
+}
+
 class wltc_state : public driver_device
 {
 public:
@@ -127,6 +138,8 @@ public:
 		m_uart(*this, "uart"),
 		m_scc(*this, "scc"),
 		m_scsi(*this, "scsi5380"),
+		m_fdc(*this, "fdc"),
+		m_floppy(*this, "fdc:1"),
 		m_screen(*this, "screen"),
 		m_shadow(*this, "shadow"),
 		m_lowram(*this, "lowram"),
@@ -154,6 +167,8 @@ private:
 	required_device<ins8250_device> m_uart;
 	required_device<scc8530_device> m_scc;
 	required_device<ncr5380_device> m_scsi;
+	required_device<upd765a_device> m_fdc;
+	required_device<floppy_connector> m_floppy;
 	required_device<screen_device> m_screen;
 	required_shared_ptr<uint16_t> m_shadow;
 	required_shared_ptr<uint16_t> m_lowram;
@@ -281,6 +296,7 @@ private:
 	bool m_dma_tc = false;
 	bool m_dma_drq = false;
 	bool m_dma_recv = true;
+	bool m_dma_floppy = false;
 
 	// Keyboard/console microcontroller. It talks over a two-way byte
 	// channel: status at 0x2b02 (bit 0 ready to accept a byte, bit 1 a
@@ -394,6 +410,8 @@ private:
 		case 0x05: m_dma_addr = (m_dma_addr & 0xf00ff) | (data << 8); break;
 		case 0x06: m_dma_addr = (m_dma_addr & 0x0ffff) | ((data & 0x0f) << 16); break;
 		case 0x0a:
+			if (m_dma_floppy)
+				m_fdc->tc_w(false);
 			m_dma_go = BIT(data, 2);
 			// the disk driver writes the command before the address and
 			// the count, so there is nothing worth printing here yet
@@ -425,8 +443,16 @@ private:
 		address_space &space = m_maincpu->space(AS_PROGRAM);
 		while (dma_armed() && m_dma_drq)
 		{
+			// terminal count goes out with the last byte, not after it:
+			// the controller looks at it while it is still handing that
+			// byte over, and told afterwards it just keeps waiting
+			if (!m_dma_count && m_dma_floppy)
+				m_fdc->tc_w(true);
 			if (m_dma_recv)
-				space.write_byte(m_dma_addr, m_scsi->dma_r());
+				space.write_byte(m_dma_addr,
+						m_dma_floppy ? m_fdc->dma_r() : m_scsi->dma_r());
+			else if (m_dma_floppy)
+				m_fdc->dma_w(space.read_byte(m_dma_addr));
 			else
 				m_scsi->dma_w(space.read_byte(m_dma_addr));
 			m_dma_addr = (m_dma_addr + 1) & 0xfffff;
@@ -438,8 +464,16 @@ private:
 	{
 		m_dma_go = false;
 		m_dma_tc = true;
-		m_scsi->eop_w(1);
-		m_scsi->eop_w(0);
+		if (m_dma_floppy)
+		{
+			// leave terminal count asserted; it is lowered when the next
+			// transfer is armed
+		}
+		else
+		{
+			m_scsi->eop_w(1);
+			m_scsi->eop_w(0);
+		}
 		logerror("DMA complete, end address %05x\n", m_dma_addr);
 		// vector 0x23, unmasked by bit 3 of 0x2202 (active low)
 		if (m_legacy_bios && !BIT(m_int_enable_2202, 3))
@@ -448,6 +482,27 @@ private:
 			m_maincpu->set_input_line(0, HOLD_LINE);
 		}
 	}
+	static void floppy_formats(format_registration &fr)
+	{
+		fr.add_pc_formats();
+	}
+	// The controller's interrupt line shows up in bit 5 of 0x2b02: the
+	// disk driver writes 0x2818 and then spins on that bit at FCF89
+	// before reading the result bytes.
+	void fdc_int_w(int state)
+	{
+		m_fdc_int = bool(state);
+		// The floppy shares the DMA source: the vector 0x83 handler at
+		// FD31E checks 0x2b0a for the DMA and the SCSI, and failing both
+		// reads 0x2b02 and services the controller on bit 5.
+		if (state && m_legacy_bios && !BIT(m_int_enable_2202, 3))
+		{
+			m_gate_vector = m_vector_base + 3;
+			m_maincpu->set_input_line(0, HOLD_LINE);
+		}
+	}
+	bool m_fdc_int = false;
+	bool m_stat_2800 = true;
 	IRQ_CALLBACK_MEMBER(irq_ack)
 	{
 		// once the BIOS has programmed the controller its own vector
@@ -585,6 +640,18 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		if ((offset & 7) == 7 && !machine().side_effects_disabled())
 			m_scsi_rst_irq = false;
 		return m_scsi->read(offset & 7);
+	}
+
+	// Floppy controller: 0x2814 main status, 0x2816 data - see the
+	// machine config
+	if ((offset << 1) == 0x2814 && ACCESSING_BITS_0_7)
+		return m_fdc->msr_r();
+	if ((offset << 1) == 0x2816 && ACCESSING_BITS_0_7)
+	{
+		uint8_t const v = m_fdc->fifo_r();
+		if (!machine().side_effects_disabled())
+			logerror("FDC risultato %02x\n", v);
+		return v;
 	}
 
 	// Z8530 serial communications controller at 0x2500-0x2506, one
@@ -755,15 +822,33 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		// byte, bit 1 a byte waiting to be read.
 		//
 		// The rest of the byte is not the console's. Bit 3 says whether
-		// a second floppy drive is attached: the start-up loop tries
-		// drive A, drive B and then the Winchester in turn, and its
-		// drive B leg at FC3B8 reads this port and returns if bit 3 is
-		// high. Idle on the real machine this port reads 0xfc - bit 3
-		// high, no drive B - so returning the console bits alone left
-		// every other line low and the machine kept trying to start from
-		// a drive that is not there.
+		// the external floppy drive is attached: the start-up loop tries
+		// drive A, drive B and the Winchester in turn, and its drive B
+		// leg at FC3B8 reads this port and gives up if bit 3 is high.
+		// Drive B is the 765 at 0x2814 - the routines that talk to it
+		// run only when the unit flag at [0x44b3] is 1, which is what
+		// the drive B leg sets, while drive A takes the SCSI path - and
+		// the maintenance manual says to load the diagnostic diskette in
+		// drive B. Idle on a machine with no drive fitted this port
+		// reads 0xfc, bit 3 high; report the drive when there is a disk
+		// in it.
+		//
+		// Bits 4 and 5 are the two the interrupt handler sorts on. It
+		// reaches FCEDE whenever either is high and loops there until
+		// both are low: bit 5 sends it to the controller, bit 4 to a
+		// strobe of 0x2800 and round again - so 0x2800 is what takes bit
+		// 4 down, and leaving that bit permanently high spins the loop
+		// forever. Both are high in the measured idle byte, so bit 4
+		// starts set and stays down once acknowledged; bit 5 is the
+		// controller's own interrupt line.
 		if (m_legacy_bios)
-			return 0xfc | m_kb_status;
+		{
+			floppy_image_device *const f = m_floppy->get_device();
+			return 0xc4
+					| ((f && f->exists()) ? 0 : 0x08)
+					| (m_fdc_int ? 0x20 : 0)
+					| m_kb_status;
+		}
 		return 0x00fe; // measured 0xfc idle; bit1 (ready to accept) forced high
 	case 0x2e1e: return 0x00f4; // mode/config register, measured on real hardware:
 	                            // 0xf4 in Wang mode, 0xfc in Industry Standard mode
@@ -827,6 +912,34 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		else
 			m_maincpu->space(AS_PROGRAM).install_ram(0xf0000, 0xfffff,
 					reinterpret_cast<uint8_t *>(m_fram.target()));
+	}
+
+	if ((offset << 1) == 0x2816 && ACCESSING_BITS_0_7)
+	{
+		logerror("FDC comando %02x\n", data & 0xff);
+		m_fdc->fifo_w(data & 0xff);
+		return;
+	}
+	// 0x2810 picks which controller the DMA serves. FCE07 writes it
+	// from the unit flag at [0x44b3] right before programming the
+	// transfer: 0 for the SCSI path that drive A and the Winchester
+	// take, 1 for the floppy.
+	if ((offset << 1) == 0x2810 && ACCESSING_BITS_0_7)
+	{
+		m_dma_floppy = BIT(data, 0);
+		// the 5380's start-DMA strobes are what set the direction on the
+		// SCSI side; the floppy has no equivalent here, and every
+		// transfer the start-up code asks it for is a read
+		if (m_dma_floppy)
+			m_dma_recv = true;
+		return;
+	}
+	// 0x2818 is written once per operation at FCF7D, just before the
+	// driver waits on the controller's interrupt
+	if ((offset << 1) == 0x2818 && ACCESSING_BITS_0_7)
+	{
+		logerror("floppy select %02x\n", data & 0xff);
+		return;
 	}
 
 	// End-of-interrupt for the DMA source, and with it the terminal
@@ -1040,6 +1153,9 @@ void wltc_state::machine_reset()
 	m_kb_ready_again = false;
 	m_kb_rx = 0;
 	m_kb_replies.clear();
+	// nothing in the machine switches the drive motor, so spin it
+	if (floppy_image_device *const f = m_floppy->get_device())
+		f->mon_w(0);
 	// the micro announces itself ready a few hundred microseconds after
 	// each exchange, which is what raises the vector 0x22 interrupt
 	m_kb_poll->adjust(attotime::from_usec(200), 0, attotime::from_usec(200));
@@ -1487,6 +1603,29 @@ void wltc_state::wltc(machine_config &config)
 	scsibus.set_external_device(7, m_scsi);
 	m_scsi->irq_handler().set(m_pic, FUNC(pic8259_device::ir5_w));
 	m_scsi->drq_handler().set(FUNC(wltc_state::dma_drq_w));
+
+	// Floppy controller at 0x2814/0x2816, one register every other
+	// address like everything else here. The ROM names the part: FCED6
+	// reads 0x2814 and spins on bit 7, then shifts bit 6 into the carry
+	// - request for master and data direction, the main status register
+	// of a 765 - and the command phase at FCEA1 and the result phase at
+	// FCFEF push and pull bytes through 0x2816. The maintenance manual's
+	// manufacturing menu calls its two floppy tests Recalibrate and
+	// Seek, which are that family's command names. The drive is external
+	// and the system diskettes are 360K: 40 cylinders, two heads, nine
+	// sectors.
+	UPD765A(config, m_fdc, 8'000'000, true, true);
+	m_fdc->intrq_wr_callback().set(FUNC(wltc_state::fdc_int_w));
+	m_fdc->drq_wr_callback().set(FUNC(wltc_state::dma_drq_w));
+	// The drive answers as unit 1: the start-up code's drive B leg sets
+	// the unit byte at [0x44f8] to 1, and that 1 is what follows the
+	// recalibrate opcode into the controller. Unit 0 is drive A, which
+	// is not on this controller at all - its leg takes the SCSI path -
+	// so leave that connector empty.
+	FLOPPY_CONNECTOR(config, "fdc:0", wltc_floppies, nullptr,
+			wltc_state::floppy_formats);
+	FLOPPY_CONNECTOR(config, "fdc:1", wltc_floppies, "525dd",
+			wltc_state::floppy_formats).enable_sound(true);
 
 	// Z8530APS serial communications controller at 0x2500.
 	//
