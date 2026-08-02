@@ -1397,11 +1397,25 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		return;
 	}
 
-	// Interrupt vector base register - see m_vector_base
+	// Interrupt vector base register - see m_vector_base.
+	//
+	// Only bit 7. The port is not a plain base register: the ROM writes
+	// it at F1394 in the middle of programming the SCC, right after
+	// 0x2c0e, and the serial module keeps shadow bytes for the pair
+	// (0x2c0c from es:[0x42], 0x2c0e from es:[0x43]) and ORs bits into
+	// them - it writes 0x00 three times and then 0x0a while setting up a
+	// channel. Reading the whole byte as a base moved it to 0x08 there
+	// and sent the disk interrupt to vector 0x0b, which the stage after
+	// the loader points at a bare iret; its own handlers are still on
+	// 0x80-0x87, the vector 0x83 among them. Bit 7 is the only part of
+	// this register we have evidence for, and only ever set.
 	if ((offset << 1) == 0x2c0c && ACCESSING_BITS_0_7)
 	{
-		m_vector_base = data & 0xf8;
-		logerror("gate array vector base = %02x\n", m_vector_base);
+		if (BIT(data, 7))
+		{
+			m_vector_base = 0x80;
+			logerror("gate array vector base = %02x\n", m_vector_base);
+		}
 		return;
 	}
 

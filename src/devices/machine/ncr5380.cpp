@@ -364,6 +364,35 @@ void ncr5380_device::mode_w(u8 data)
 		m_scsi_bus->ctrl_w(m_scsi_refid, 0, S_ACK);
 	}
 
+	// enable dma
+	if (!(m_mode & MODE_DMA) && (data & MODE_DMA) && !(data & MODE_TARGET))
+	{
+		// The phase comparison is a level, not an edge.  Turning DMA mode on
+		// while the target already has R̅E̅Q̅ up on a phase the target command
+		// register cannot match is a mismatch straight away (SP-1051 8.5),
+		// and waiting for the next R̅E̅Q̅ edge misses it entirely: firmware
+		// that selects, points the register at a phase it knows cannot match
+		// and then turns DMA mode on is arming the mismatch interrupt
+		// deliberately, so its handler can read the real phase back out -
+		// the Wang LapTop's disk service is written exactly that way - and
+		// whether the target raised R̅E̅Q̅ before or after the mode write is
+		// not something it can control.
+		u32 const ctrl = m_scsi_bus->ctrl_r();
+
+		if ((ctrl & S_REQ) && (ctrl & S_PHASE_MASK) != (m_tcmd & TC_PHASE))
+		{
+			LOG("phase mismatch on dma enable %d != %d\n", (ctrl & S_PHASE_MASK), (m_tcmd & TC_PHASE));
+
+			m_state = IDLE;
+			m_state_timer->enable(false);
+
+			// direction matters for DRQ exactly as on the R̅E̅Q̅ edge
+			if (!(m_tcmd & TC_IO))
+				set_drq(true);
+			set_irq(true);
+		}
+	}
+
 	// start/stop arbitration
 	if ((m_mode ^ data) & MODE_ARBITRATE)
 	{
