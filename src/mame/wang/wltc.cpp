@@ -225,18 +225,27 @@ protected:
 			// the result bytes themselves start five in. The block that
 			// receives it insists on at least seven bytes.
 			//
-			// The reply does not get through yet, and the fault is on
-			// this side of the bus rather than in the frame. Watching
-			// memory while it runs: the firmware's byte loop at FC9C7
-			// stores through es:di at FC9DC and every transfer writes a
-			// single byte, always 0x00, always to the first byte of the
-			// buffer - so it reads zero out of the 5380's data register
-			// and its phase check at FC884 then says the phase is over.
-			// The count it files at FCA02 is 1, and FD1E2 wants seven
-			// before it will unpack anything. Meanwhile this device hands
-			// over all seven or twelve bytes, so the two sides disagree
-			// about the handshake, not about the contents. FC884 and the
-			// acknowledge at FC9E9-FC9FC are where to look.
+			// This still does not reach the firmware, and now it is clear
+			// why: the result does not come back in the data phase at
+			// all. There is a jump table at FC00:097D indexed by the bus
+			// phase, and each phase has its own buffer - data in reads
+			// into 0x452e, status into 0x4525, and MESSAGE IN into
+			// 0x453c, whose buffer is at 0x4544. That is the one FD1E2
+			// unpacks. And the first byte it insists on, 1, is the SCSI
+			// code for an extended message.
+			//
+			// So the drive answers with the floppy controller's result
+			// bytes as an extended message: 01, the count plus three,
+			// three bytes this firmware steps over, then the results.
+			// Sending that needs a multi-byte message in, and the control
+			// queue that would carry it is private to nscsi_full_device -
+			// a small addition to that class rather than something to
+			// bodge from here.
+			//
+			// The data phase itself works, incidentally: logging both
+			// ends shows the initiator reading 01 05 00 00 ... in step
+			// with this device sending them. It is simply the wrong
+			// phase.
 			//
 			// What will judge it, once it arrives, is FCCA7 onwards: the
 			// sector size in the read id result must be 1, 2 or 3, and
@@ -295,7 +304,8 @@ protected:
 	virtual uint8_t scsi_get_data(int id, int pos) override
 	{
 		uint8_t const v = nscsi_full_device::scsi_get_data(id, pos);
-		logerror("drive A dato[%d] = %02x\n", pos, v);
+		logerror("target consegna dato[%d] = %02x @ %s\n",
+				pos, v, machine().time().as_string(6));
 		return v;
 	}
 
@@ -820,7 +830,13 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		// reading reset-parity/interrupt clears the pending interrupt
 		if ((offset & 7) == 7 && !machine().side_effects_disabled())
 			m_scsi_rst_irq = false;
-		return m_scsi->read(offset & 7);
+		{
+			uint8_t const v = m_scsi->read(offset & 7);
+			if ((offset & 7) == 0 && !machine().side_effects_disabled())
+				logerror("  iniziatore legge dato %02x @ %s\n",
+						v, machine().time().as_string(6));
+			return v;
+		}
 	}
 
 	// Floppy controller: 0x2814 main status, 0x2816 data - see the
