@@ -157,6 +157,7 @@ protected:
 		m_kb_timer = timer_alloc(FUNC(wltc_state::kb_reply_cb), this);
 		m_rtc_timer = timer_alloc(FUNC(wltc_state::rtc_periodic), this);
 		m_kb_poll = timer_alloc(FUNC(wltc_state::kb_poll_cb), this);
+		m_dma_timer = timer_alloc(FUNC(wltc_state::dma_service_cb), this);
 	}
 	virtual void machine_reset() override ATTR_COLD;
 
@@ -435,19 +436,22 @@ private:
 	void dma_drq_w(int state)
 	{
 		m_dma_drq = state;
+		// Serve the request outside the requesting device's own call
+		// stack. The floppy controller raises this from inside its live
+		// state machine, and taking the byte straight back out of its
+		// FIFO from in there leaves that machine unable to finish the
+		// sector - it read all eight and then sat on the last one, with
+		// terminal count asserted and nothing happening.
 		if (state)
-			dma_service();
+			m_dma_timer->adjust(attotime::zero);
 	}
+	TIMER_CALLBACK_MEMBER(dma_service_cb) { dma_service(); }
+	emu_timer *m_dma_timer = nullptr;
 	void dma_service()
 	{
 		address_space &space = m_maincpu->space(AS_PROGRAM);
 		while (dma_armed() && m_dma_drq)
 		{
-			// terminal count goes out with the last byte, not after it:
-			// the controller looks at it while it is still handing that
-			// byte over, and told afterwards it just keeps waiting
-			if (!m_dma_count && m_dma_floppy)
-				m_fdc->tc_w(true);
 			if (m_dma_recv)
 				space.write_byte(m_dma_addr,
 						m_dma_floppy ? m_fdc->dma_r() : m_scsi->dma_r());
@@ -466,8 +470,9 @@ private:
 		m_dma_tc = true;
 		if (m_dma_floppy)
 		{
-			// leave terminal count asserted; it is lowered when the next
-			// transfer is armed
+			// terminal count goes out after the last byte and stays out
+			// until the next transfer is armed
+			m_fdc->tc_w(true);
 		}
 		else
 		{
