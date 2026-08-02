@@ -225,13 +225,18 @@ protected:
 			// the result bytes themselves start five in. The block that
 			// receives it insists on at least seven bytes.
 			//
-			// The firmware does follow a data-in phase here and reads
-			// exactly what is offered, but the reply never reaches the
-			// result bytes at 0x44e6: the descriptor at 0x453c - buffer
-			// pointer, segment, length, capacity - comes out of the
-			// transfer with a length of 1, and FD1E2 gives up on anything
-			// under seven. So something on that side has to be told how
-			// much to expect before this can be judged by its contents.
+			// The reply does not get through yet, and the fault is on
+			// this side of the bus rather than in the frame. Watching
+			// memory while it runs: the firmware's byte loop at FC9C7
+			// stores through es:di at FC9DC and every transfer writes a
+			// single byte, always 0x00, always to the first byte of the
+			// buffer - so it reads zero out of the 5380's data register
+			// and its phase check at FC884 then says the phase is over.
+			// The count it files at FCA02 is 1, and FD1E2 wants seven
+			// before it will unpack anything. Meanwhile this device hands
+			// over all seven or twelve bytes, so the two sides disagree
+			// about the handshake, not about the contents. FC884 and the
+			// acknowledge at FC9E9-FC9FC are where to look.
 			//
 			// What will judge it, once it arrives, is FCCA7 onwards: the
 			// sector size in the read id result must be 1, 2 or 3, and
@@ -285,6 +290,13 @@ protected:
 		}
 
 		nscsi_full_device::scsi_command();
+	}
+
+	virtual uint8_t scsi_get_data(int id, int pos) override
+	{
+		uint8_t const v = nscsi_full_device::scsi_get_data(id, pos);
+		logerror("drive A dato[%d] = %02x\n", pos, v);
+		return v;
 	}
 
 private:
