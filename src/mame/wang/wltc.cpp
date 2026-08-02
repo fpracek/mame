@@ -46,6 +46,8 @@
 #include "machine/timer.h"
 #include "screen.h"
 
+#include <deque>
+
 
 namespace {
 
@@ -77,6 +79,7 @@ protected:
 		// timers must be allocated before save-state registration closes
 		m_kb_timer = timer_alloc(FUNC(wltc_state::kb_reply_cb), this);
 		m_rtc_timer = timer_alloc(FUNC(wltc_state::rtc_periodic), this);
+		m_kb_poll = timer_alloc(FUNC(wltc_state::kb_poll_cb), this);
 	}
 	virtual void machine_reset() override ATTR_COLD;
 
@@ -196,6 +199,52 @@ private:
 	uint8_t m_gate_vector = 0x20;
 	uint8_t const *m_chargen = nullptr;
 	emu_timer *m_rtc_timer = nullptr;
+
+	// Keyboard/console microcontroller. It talks over a two-way byte
+	// channel: status at 0x2b02 (bit 0 ready to accept a byte, bit 1 a
+	// byte waiting to be read), data both ways at 0x2a08, acknowledge
+	// at 0x2c10/0x2c1e, and an interrupt on vector 0x22 whenever either
+	// status bit is set and bit 2 of 0x2202 enables it.
+	//
+	// The POST's keyboard test at F155B drives exactly that: it sends
+	// 0x1d, 0x0a and 0x1e, each on a transmit-ready interrupt, then
+	// expects two bytes back - 0x01 then 0x00 - each on a receive
+	// interrupt, stores them as AH and AL and demands AX == 0x0100.
+	uint8_t m_kb_status = 0x01;
+	uint8_t m_kb_rx = 0;
+	std::deque<uint8_t> m_kb_replies;
+	emu_timer *m_kb_poll = nullptr;
+	void kb_command(uint8_t cmd)
+	{
+		// the 0x1d/0x0a/0x1e sequence ends with an identify, answered
+		// with 0x01 0x00
+		if (cmd == 0x1e)
+		{
+			m_kb_replies.push_back(0x01);
+			m_kb_replies.push_back(0x00);
+		}
+		m_kb_status &= ~0x01;
+	}
+	TIMER_CALLBACK_MEMBER(kb_poll_cb)
+	{
+		if (!m_legacy_bios)
+			return;
+		if (!(m_kb_status & 0x02) && !m_kb_replies.empty())
+		{
+			m_kb_rx = m_kb_replies.front();
+			m_kb_replies.pop_front();
+			m_kb_status |= 0x02;
+		}
+		else if (!(m_kb_status & 0x03))
+		{
+			m_kb_status |= 0x01;
+		}
+		if ((m_kb_status & 0x03) && !BIT(m_int_enable_2202, 2))
+		{
+			m_gate_vector = 0x22;
+			m_maincpu->set_input_line(0, HOLD_LINE);
+		}
+	}
 	TIMER_CALLBACK_MEMBER(rtc_periodic)
 	{
 		// register C picks up the periodic flag; the interrupt goes out
@@ -490,8 +539,22 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 			return v;
 		}
 		return m_rtc[m_index_sel & 0x3f];
-	case 0x2a08: return 0x0044; // handshake status, bit7 = busy, measured idle
-	case 0x2b02: return 0x00fe; // measured 0xfc idle; bit1 (ready to accept) forced high
+	case 0x2a08:
+		// data from the keyboard/console micro; on the 1986 hardware
+		// reading it takes the byte and clears the receive flag
+		if (m_legacy_bios)
+		{
+			if (!machine().side_effects_disabled())
+				m_kb_status &= ~0x02;
+			return m_kb_rx;
+		}
+		return 0x0044; // handshake status, bit7 = busy, measured idle
+	case 0x2b02:
+		// keyboard/console channel status: bit 0 ready to accept a
+		// byte, bit 1 a byte waiting to be read
+		if (m_legacy_bios)
+			return m_kb_status;
+		return 0x00fe; // measured 0xfc idle; bit1 (ready to accept) forced high
 	case 0x2e1e: return 0x00f4; // mode/config register, measured on real hardware:
 	                            // 0xf4 in Wang mode, 0xfc in Industry Standard mode
 	                            // (bit3 = IS mode); bit7=1 (display type, LCD) selects
@@ -669,6 +732,8 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	}
 	if ((offset << 1) == 0x2a08)
 	{
+		if (m_legacy_bios)
+			kb_command(data & 0xff);
 		switch (data & 0xff)
 		{
 		case 0x0b: logerror("beeper: tone\n"); break;
@@ -721,6 +786,12 @@ void wltc_state::machine_reset()
 {
 	m_fseg_logged.assign(0x8000, 0);
 	m_tick_int = false;
+	m_kb_status = 0x01;
+	m_kb_rx = 0;
+	m_kb_replies.clear();
+	// the micro announces itself ready a few hundred microseconds after
+	// each exchange, which is what raises the vector 0x22 interrupt
+	m_kb_poll->adjust(attotime::from_usec(200), 0, attotime::from_usec(200));
 	if (!m_vram)
 		m_vram = std::make_unique<uint8_t[]>(0x20000);
 	std::fill_n(&m_vram[0], 0x20000, 0);
