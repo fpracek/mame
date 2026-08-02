@@ -1196,6 +1196,27 @@ void wltc_state::wltc(machine_config &config)
 		return m_maincpu->space(AS_PROGRAM).read_byte(offset); });
 	m_dmac->out_memw_callback().set([this](offs_t offset, uint8_t data) {
 		m_maincpu->space(AS_PROGRAM).write_byte(offset, data); });
+	// The controller has no separate bus arbiter here: loop its hold
+	// request straight back as an acknowledge, the usual arrangement
+	// when the DMA controller owns the bus by itself.
+	m_dmac->out_hreq_callback().set(m_dmac, FUNC(am9517a_device::hack_w));
+	// Channel 0 serves the SCSI controller: the disk read at F1186 puts
+	// the 5380 in DMA mode and starts an initiator receive, and without
+	// the request line and the data path the transfer never happens.
+	//
+	// This is not enough on its own, because the controller at
+	// 0x2300-0x230f is not an 8237 with byte-wide registers, which is
+	// what this am9517a stands in as. The BIOS programs a SCSI transfer
+	// as: word count 0x000f to 0x2302 - sixteen bytes, exactly the
+	// allocation length of the REQUEST SENSE it just sent - address
+	// 0x04b9 to 0x2304, a byte to 0x2306, then a command to 0x230a. An
+	// 8237 would take channel 0's address and count through registers 0
+	// and 1 with a byte flip-flop, so the Wang part has its own layout:
+	// count, address and page in separate 16-bit registers. Identifying
+	// it properly is what the Winchester command test is waiting for.
+	m_dmac->in_ior_callback<0>().set(m_scsi, FUNC(ncr5380_device::dma_r));
+	m_dmac->out_iow_callback<0>().set(m_scsi, FUNC(ncr5380_device::dma_w));
+	m_dmac->out_eop_callback().set(m_scsi, FUNC(ncr5380_device::eop_w));
 
 	PIT8254(config, m_pit);
 	// 3.072 MHz: the POST timer test at F032B loads counter 0 with 2000
@@ -1240,6 +1261,7 @@ void wltc_state::wltc(machine_config &config)
 	NCR5380(config, m_scsi);
 	scsibus.set_external_device(7, m_scsi);
 	m_scsi->irq_handler().set(m_pic, FUNC(pic8259_device::ir5_w));
+	m_scsi->drq_handler().set(m_dmac, FUNC(am9517a_device::dreq0_w));
 
 	// Z8530APS serial communications controller at 0x2500
 	SCC8530(config, m_scc, 8_MHz_XTAL / 2);
