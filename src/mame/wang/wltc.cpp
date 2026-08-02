@@ -260,6 +260,15 @@ private:
 	// word. Latch the source's vector at the OUT edge.
 	uint8_t m_int_enable_2202 = 0xff;
 	uint8_t m_gate_vector = 0x20;
+	// Vector base of the gate array's interrupt controller. Each source
+	// answers with base + its own enable bit in 0x2202, and the base is
+	// what 0x2c0c holds: 0x20 out of reset, which is where the POST puts
+	// its handlers, and 0x80 once F139A writes it - which is where the
+	// stage after the POST puts its own. That stage installs handlers on
+	// 0x81, 0x82 and 0x83 - counter 2, console and DMA, the same three
+	// bits it leaves open in 0x2202 - and points all 244 other vectors at
+	// the routine that reports "***42 Invalid Interrupt - Restart".
+	uint8_t m_vector_base = 0x20;
 	uint8_t const *m_chargen = nullptr;
 	emu_timer *m_rtc_timer = nullptr;
 
@@ -284,6 +293,7 @@ private:
 	// expects two bytes back - 0x01 then 0x00 - each on a receive
 	// interrupt, stores them as AH and AL and demands AX == 0x0100.
 	uint8_t m_kb_status = 0x01;
+	bool m_kb_ready_again = false;
 	uint8_t m_kb_rx = 0;
 	std::deque<uint8_t> m_kb_replies;
 	emu_timer *m_kb_poll = nullptr;
@@ -296,25 +306,36 @@ private:
 			m_kb_replies.push_back(0x01);
 			m_kb_replies.push_back(0x00);
 		}
+		// taking the byte makes the micro busy, and ready again a moment
+		// later - that re-arming is what carries the test from one byte
+		// to the next
 		m_kb_status &= ~0x01;
+		m_kb_ready_again = true;
 	}
 	TIMER_CALLBACK_MEMBER(kb_poll_cb)
 	{
 		if (!m_legacy_bios)
 			return;
+		// The request is a level: the micro asks as long as it has a byte
+		// waiting or is ready to take one. It is ready out of reset, so
+		// the keyboard test gets its first transmit interrupt with no
+		// preceding write; after that it is only ready again once it has
+		// actually taken a byte. An acknowledge that sends nothing - all
+		// the later stage's handler ever does - leaves it quiet.
 		if (!(m_kb_status & 0x02) && !m_kb_replies.empty())
 		{
 			m_kb_rx = m_kb_replies.front();
 			m_kb_replies.pop_front();
 			m_kb_status |= 0x02;
 		}
-		else if (!(m_kb_status & 0x03))
+		else if (!(m_kb_status & 0x03) && m_kb_ready_again)
 		{
 			m_kb_status |= 0x01;
+			m_kb_ready_again = false;
 		}
 		if ((m_kb_status & 0x03) && !BIT(m_int_enable_2202, 2))
 		{
-			m_gate_vector = 0x22;
+			m_gate_vector = m_vector_base + 2;
 			m_maincpu->set_input_line(0, HOLD_LINE);
 		}
 	}
@@ -328,7 +349,7 @@ private:
 				machine().time().as_string(6), m_int_enable_2202);
 		if (m_legacy_bios && !BIT(m_int_enable_2202, 5))
 		{
-			m_gate_vector = 0x25;
+			m_gate_vector = m_vector_base + 5;
 			m_maincpu->set_input_line(0, HOLD_LINE);
 		}
 	}
@@ -337,7 +358,7 @@ private:
 	{
 		if (m_legacy_bios && state && !BIT(m_int_enable_2202, N - 1))
 		{
-			m_gate_vector = 0x20 + (N - 1);
+			m_gate_vector = m_vector_base + (N - 1);
 			m_maincpu->set_input_line(0, HOLD_LINE);
 		}
 	}
@@ -417,7 +438,7 @@ private:
 		// vector 0x23, unmasked by bit 3 of 0x2202 (active low)
 		if (m_legacy_bios && !BIT(m_int_enable_2202, 3))
 		{
-			m_gate_vector = 0x23;
+			m_gate_vector = m_vector_base + 3;
 			m_maincpu->set_input_line(0, HOLD_LINE);
 		}
 	}
@@ -793,9 +814,23 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 					reinterpret_cast<uint8_t *>(m_fram.target()));
 	}
 
+	// Interrupt vector base register - see m_vector_base
+	if ((offset << 1) == 0x2c0c && ACCESSING_BITS_0_7)
+	{
+		m_vector_base = data & 0xf8;
+		logerror("gate array vector base = %02x\n", m_vector_base);
+		return;
+	}
+
 	if ((offset << 1) == 0x2202)
 	{
 		m_int_enable_2202 = data & 0xff;
+		// Masking a source takes its request off the line. Without this
+		// a request raised just before the mask survives until the CPU
+		// next enables interrupts, and by then whoever armed the source
+		// has moved on.
+		if (m_legacy_bios && BIT(m_int_enable_2202, m_gate_vector - m_vector_base))
+			m_maincpu->set_input_line(0, CLEAR_LINE);
 		return;
 	}
 
@@ -907,6 +942,15 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	// answered with a reply interrupt on IRQ1 carrying event code 6.
 	if ((offset << 1) == 0x2c1e)
 	{
+		// This is the acknowledge for the transmit-ready condition, and
+		// both console handlers turn on it. The one the POST installs
+		// strobes it and then sends its byte; the one the stage after the
+		// POST installs at FD35F strobes it and re-reads 0x2b02 in a
+		// loop, leaving only when bit 0 has gone - so the strobe has to
+		// clear that bit, and the bit must not come back on its own or
+		// the loop never ends.
+		if (m_legacy_bios)
+			m_kb_status &= ~0x01;
 		m_kb_reply = 0xfa;
 		m_kb_timer->adjust(attotime::from_usec(200));
 		logerror("kb cmd %02x -> reply irq scheduled\n", data & 0xff);
@@ -968,6 +1012,7 @@ void wltc_state::machine_reset()
 	m_fseg_logged.assign(0x8000, 0);
 	m_tick_int = false;
 	m_kb_status = 0x01;
+	m_kb_ready_again = false;
 	m_kb_rx = 0;
 	m_kb_replies.clear();
 	// the micro announces itself ready a few hundred microseconds after
