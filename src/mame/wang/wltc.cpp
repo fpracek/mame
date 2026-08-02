@@ -504,6 +504,40 @@ private:
 	uint8_t m_irq_vector = 0x80;
 	bool m_tick_int = false;
 	bool m_scsi_rst_irq = false;
+	bool m_scsi_irq = false;
+	// The 5380's own interrupt line. In the 1986 gate-array scheme it
+	// shares vector 0x23 with the DMA controller: the handler reads
+	// 0x2b0a and splits on bit 2 (the 5380 interrupted) against bit 5
+	// (terminal count), so the line has to show up in that word as well
+	// as raise the request. The loaded system's SCSI service selects the
+	// target, leaves the target command register on a phase that cannot
+	// match and turns on DMA mode - it is arming the phase-mismatch
+	// interrupt on purpose and reads the real phase in the handler. With
+	// the line going nowhere it waits forever with its busy flag set,
+	// which is where INT 88h function 0x27 was hanging.
+	void scsi_int_w(int state)
+	{
+		m_scsi_irq = bool(state);
+		if (!m_legacy_bios)
+		{
+			m_pic->ir5_w(state);
+			return;
+		}
+		scsi_int_update();
+	}
+	// The line is a level, not an edge. The service raises it while its
+	// own vector is masked - it masks 0x2202 bit 3 around the phase
+	// change and opens it again on the way out - so the request has to
+	// survive the mask and be delivered when the mask lifts, which is
+	// what the gate array does and what the firmware counts on.
+	void scsi_int_update()
+	{
+		if (m_legacy_bios && m_scsi_irq && !BIT(m_int_enable_2202, 3))
+		{
+			m_gate_vector = m_vector_base + 3;
+			m_maincpu->set_input_line(0, HOLD_LINE);
+		}
+	}
 	uint8_t m_kb_reply = 0;
 	uint8_t m_index_sel = 0xff;
 	uint8_t m_rtc[0x40];
@@ -682,9 +716,10 @@ private:
 	//     0x2302 = word, transfer count minus one
 	//     0x2304 = word, physical address bits 15:0
 	//     0x2306 = byte, physical address bits 19:16
-	//     0x230a = command, 0x44 to run   (0x18 in the self test at
-	//              F0375, which programs a count but never transfers -
-	//              hence reading bit 2 as the go bit)
+	//     0x230a = command, bit 6 runs the channel and bits 2/3 are the
+	//              direction: 0x44 reads into memory, 0x48 writes out of
+	//              it (0x18 in the self test at F0375, which programs a
+	//              count but never transfers)
 	//     0x230b = read to acknowledge the terminal count
 	//     0x230f = bit 1 masks the channel: F118D clears it to let the
 	//              transfer run, the ISR sets it again on the way out
@@ -707,7 +742,16 @@ private:
 		case 0x0a:
 			if (m_dma_floppy)
 				m_fdc->tc_w(false);
-			m_dma_go = BIT(data, 2);
+			// Bit 6 is the one that runs the channel; bits 2 and 3 are
+			// the direction, and taking bit 2 for the go bit only looked
+			// right because everything measured until now was a read.
+			// The loaded system's SCSI service sends its six-byte command
+			// block out the same channel and writes 0x48 for it - bit 6
+			// with the other direction bit - and with bit 2 as the go bit
+			// that transfer never started, which is where the command
+			// phase stalled. The self test at F0375 writes 0x18, programs
+			// a count and never transfers: bit 6 clear, so still no run.
+			m_dma_go = BIT(data, 6);
 			// the disk driver writes the command before the address and
 			// the count, so there is nothing worth printing here yet
 			logerror("DMA command %02x\n", data);
@@ -1010,7 +1054,7 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	// it used to be here, or every SCSI interrupt would also report a
 	// completed transfer.
 	if ((offset << 1) == 0x2b0a)
-		return 0xc7db | (m_scsi_rst_irq ? 0x0004 : 0) | (m_dma_tc ? 0x0020 : 0);
+		return 0xc7db | ((m_scsi_rst_irq || m_scsi_irq) ? 0x0004 : 0) | (m_dma_tc ? 0x0020 : 0);
 
 	// Console status, read by the timer-tick device poller at E11C5 as
 	// port (selector << 8) | 0x62 with the console's selector 0x10. The
@@ -1274,6 +1318,7 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		// has moved on.
 		if (m_legacy_bios && BIT(m_int_enable_2202, m_gate_vector - m_vector_base))
 			m_maincpu->set_input_line(0, CLEAR_LINE);
+		scsi_int_update();
 		return;
 	}
 
@@ -1911,7 +1956,7 @@ void wltc_state::wltc(machine_config &config)
 	fdd.option_add("wangfdd", WANG_SCSI_FLOPPY);
 	NCR5380(config, m_scsi);
 	scsibus.set_external_device(7, m_scsi);
-	m_scsi->irq_handler().set(m_pic, FUNC(pic8259_device::ir5_w));
+	m_scsi->irq_handler().set(FUNC(wltc_state::scsi_int_w));
 	m_scsi->drq_handler().set(FUNC(wltc_state::dma_drq_w));
 
 	// Floppy controller at 0x2814/0x2816, one register every other
