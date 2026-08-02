@@ -674,6 +674,19 @@ private:
 	}
 	TIMER_CALLBACK_MEMBER(kb_reply_cb)
 	{
+		// Only the 4.02.03 firmware takes its event code this way. The
+		// 1986 console interrupt is the gate array's own vector 0x82,
+		// whose handler at E000:0177 reads the reason out of 0x2b02 and
+		// touches no register of the code it interrupted - see the
+		// keyboard poll, which raises it. Writing AL from out here while
+		// that firmware runs corrupts whatever the interrupted code was
+		// holding, and since this is armed on every 0x2c1e strobe - which
+		// the console handler does for every byte of every line - it lands
+		// in the middle of the banner: the m of "Computer" was arriving on
+		// screen as 0x06, the event code itself.
+		if (m_legacy_bios)
+			return;
+
 		// The event ISR at E000:9BD2 dispatches on the event code in AL
 		// (and si,0xff / cmp 0xf / call cs:[si*2+0x2a32]); event 6 is
 		// the keyboard handler at E98AB. Deliver the code in AL with
