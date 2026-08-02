@@ -194,6 +194,7 @@ private:
 	// word. Latch the source's vector at the OUT edge.
 	uint8_t m_int_enable_2202 = 0xff;
 	uint8_t m_gate_vector = 0x20;
+	uint8_t const *m_chargen = nullptr;
 	emu_timer *m_rtc_timer = nullptr;
 	TIMER_CALLBACK_MEMBER(rtc_periodic)
 	{
@@ -262,11 +263,9 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 
 	if (tbuf)
 	{
-		// the glyphs at ROM 0xf5d1: the BIOS's own font for 4.02.03,
-		// and a stand-in for the LCD controller's internal character
-		// generator on the 1986 hardware (whose BIOS only ever writes
-		// character/attribute pairs - the controller renders them)
-		uint8_t const *const font = memregion("bios")->base() + 0xf5d1;
+		// 25 rows of 8 scanlines over the 200-line panel, one glyph row
+		// per scanline, taken from the character generator's doubled
+		// cells (every other byte of a 32-byte glyph is the 8x8 font).
 		for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
 		{
 			int const row = y >> 3, line = y & 7;
@@ -274,7 +273,7 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 			for (int x = cliprect.left(); x <= cliprect.right(); x++)
 			{
 				uint8_t const ch = tbuf[(row * 80) + (x >> 3)] & 0xff;
-				uint8_t const bits = font[(ch << 4) + (line << 1) + 1];
+				uint8_t const bits = m_chargen[(ch << 5) + (line << 1)];
 				*dst++ = BIT(bits, 7 - (x & 7)) ? fg : bg;
 			}
 		}
@@ -723,17 +722,6 @@ void wltc_state::machine_reset()
 		m_vram = std::make_unique<uint8_t[]>(0x20000);
 	std::fill_n(&m_vram[0], 0x20000, 0);
 
-	// The F EPROM carries the glyph cache pre-expanded behind the video
-	// window: 0x2000-0x3fff holds exactly 256 characters at 32 bytes
-	// each - the 8x16 font with every row doubled, the LCD's native
-	// glyph format - which is precisely the window's 8K. On hardware
-	// the window reads the EPROM until something writes over it, so the
-	// character generator is simply there at power-on; the emulated
-	// window read back RAM, which is why the POST rasterised its banner
-	// with blank glyphs. Seed the first two banks with the EPROM
-	// content.
-	memcpy(&m_vram[0], memregion("bios")->base() + 0x10000 + 0x2000, 0x2000);
-
 	// Power-on contents of the clock/scratch registers. The date and
 	// time fields are range-checked by the POST (month 1-12 at 0x10,
 	// hour 0-23 at 0x13, second 0-99 at 0x12); the values at 0x30-0x33
@@ -753,6 +741,21 @@ void wltc_state::machine_reset()
 	// below (shadow RAM, boot mirror, seeded IVT) applies to it.
 	uint8_t const *const bios = memregion("bios")->base();
 	m_legacy_bios = (bios[0] == 0xff && bios[1] == 0xff);   // E half blank: 64K image
+
+	// The character generator: 256 glyphs of 32 bytes in the F EPROM at
+	// 0x2000, which is exactly the 8K of the video window at 0xf2000.
+	// Each glyph is an 8x8 character with every row written twice -
+	// verified across all 95 printable codes, with the upper 16 bytes
+	// of the cell blank - so the display font is 8 pixels square, one
+	// row per scanline of the 640x200 panel's 25 text rows.
+	m_chargen = bios + (m_legacy_bios ? 0xa000 : 0x12000);
+
+	// On hardware the video window reads the EPROM until something
+	// writes over it, so the generator is simply present at power-on;
+	// the emulated window read back RAM, which is why the POST first
+	// rasterised its banner with blank glyphs.
+	memcpy(&m_vram[0], m_chargen, 0x2000);
+
 	if (m_legacy_bios)
 	{
 		// The customer POST migrates itself from segment F000 to E000
@@ -1201,8 +1204,8 @@ ROM_START( wltc )
 	ROMX_LOAD( "mainboard_b.bin", 0x10001, 0x8000, CRC(f38aec77) SHA1(926b947a7411a2bfa6394b6b9dfd5118bcb27228), ROM_BIOS(1) | ROM_SKIP(1) )
 	// the 1986 BIOS only writes character/attribute pairs; the LCD
 	// controller renders them from its own character generator, stood
-	// in for here by the font half of the later EPROM set
-	ROMX_LOAD( "mye800.bin", 0x08000, 0x8000, CRC(e25f4f8d) SHA1(f0bcaeb2120177ca023b5b8076852a1dfe4d5635), ROM_BIOS(1) )
+	// in for here by the glyph cache of the later EPROM set
+	ROMX_LOAD( "myf000.bin", 0x08000, 0x8000, CRC(b0d23b9d) SHA1(c068b6c897b2ffea222ff7a38d3f39ac6fba54a4), ROM_BIOS(1) )
 
 	// BIOS 4.00 as shipped on the system diskette: the file is a shadow
 	// image for segment E000 (cold start at 0x18, far call operand E4B0),
