@@ -361,6 +361,8 @@ private:
 		std::string txt;
 		for (int i = 0; i < n; i++)
 			txt += util::string_format(" %02x", res[i]);
+		for (int i = 0; i < 6 && i < int(m_data.size()); i++)
+			txt += util::string_format(" [%02x]", m_data[i]);
 		logerror("drive A: comando %02x -> risultato%s, %d byte di dati\n",
 				m_fdc_command, txt, int(m_data.size()));
 
