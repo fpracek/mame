@@ -561,12 +561,16 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	}
 
 	// Z8530 serial communications controller at 0x2500-0x2506, one
-	// register every other address in the classic B/A control/data
-	// order: the diagnostic initialises it with the textbook register
-	// sequence (wr4 0x44, wr3 0xc0, wr5 0x60, wr11 0x55, wr12/13 baud,
-	// wr14 0x12, wr9 0x80 channel reset).
+	// register every other address. The POST names the four for us:
+	// the channel B test at F13FF opens with wr9 = 0x40, channel B
+	// reset, written to 0x2500, and the channel A test with wr9 = 0x80
+	// to 0x2504; each then talks data on the address two above its
+	// control. So the channel selects on bit 1 of the register number
+	// and data/control on bit 0 - the ab_dc order, not the dc_ab one
+	// this used to ask for, which had channel A's control register
+	// answering as channel B's data.
 	if ((offset << 1) >= 0x2500 && (offset << 1) <= 0x2507)
-		return m_scc->dc_ab_r(offset & 3);
+		return m_scc->ab_dc_r(offset & 3);
 
 	// 8250-compatible serial port at the IBM-style byte addresses
 	// 0x3f8-0x3ff: a port scan on a running machine reads the classic
@@ -820,7 +824,7 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 
 	if ((offset << 1) >= 0x2500 && (offset << 1) <= 0x2507)
 	{
-		m_scc->dc_ab_w(offset & 3, data & 0xff);
+		m_scc->ab_dc_w(offset & 3, data & 0xff);
 		return;
 	}
 
@@ -1414,8 +1418,33 @@ void wltc_state::wltc(machine_config &config)
 	m_scsi->irq_handler().set(m_pic, FUNC(pic8259_device::ir5_w));
 	m_scsi->drq_handler().set(FUNC(wltc_state::dma_drq_w));
 
-	// Z8530APS serial communications controller at 0x2500
-	SCC8530(config, m_scc, 8_MHz_XTAL / 2);
+	// Z8530APS serial communications controller at 0x2500.
+	//
+	// TRxC is strapped back to RTxC on the board. The POST's loopback
+	// test says so: it writes wr11 = 0x15, which takes the transmit
+	// clock from the baud rate generator, makes TRxC an output and puts
+	// the transmit clock on it, and then takes the RECEIVE clock from
+	// the RTxC pin. Nothing else on a laptop drives RTxC, and the test
+	// does receive what it sends, so the two pins are tied together -
+	// which is also the only reason to route the transmit clock out of
+	// TRxC at all. Told statically here, since the SCC model has no
+	// TRxC output line to wire, so RTxC is given the frequency the
+	// generator puts on TRxC: PCLK / 2(TC + 2), with the time constant
+	// of 14 the POST loads into wr12/wr13. That makes the receive and
+	// transmit bit rates identical, which is the whole point of the
+	// strap; a later baud constant would need this to follow, and the
+	// strap on the board does follow it.
+	//
+	// The clock is the POST's own doing too. A time constant of 14 in
+	// the x16 mode it selects divides PCLK by 512, and a diagnostic
+	// that talks to itself over a serial port talks at 9600 baud, so
+	// PCLK is 512 * 9600 = 4.9152 MHz - one of the standard baud
+	// crystals, and not the 4 MHz guessed here before. It matters: the
+	// test polls for the received character with a loop that gives up
+	// after 255 turns, and at 4 MHz the character was still in the
+	// shift register when the loop ran out.
+	SCC8530(config, m_scc, 4'915'200);
+	m_scc->configure_channels(4'915'200 / 32, 4'915'200 / 32, 4'915'200 / 32, 4'915'200 / 32);
 	m_scc->out_int_callback().set(m_pic, FUNC(pic8259_device::ir3_w));
 
 	// 8250-compatible UART at 0x3f8, with the usual 1.8432 MHz clock
