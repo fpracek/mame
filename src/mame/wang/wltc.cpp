@@ -96,6 +96,10 @@ protected:
 		// puts REQ back up in the same instant and it never sees it low,
 		// so leave the bus quiet for a moment first.
 		set_status_delay(attotime::from_usec(500));
+		// The sector count in a read is a maximum, not a promise: the
+		// host arms its DMA for as much as it wants and stops there.
+		// Hold an unwanted byte a while, then let the rest go.
+		set_data_phase_timeout(attotime::from_usec(500));
 	}
 	virtual void scsi_command() override
 	{
@@ -188,6 +192,10 @@ protected:
 		// as on the Winchester: the start-up code wants a moment of quiet
 		// bus between the data and the status
 		set_status_delay(attotime::from_usec(500));
+		// The sector count in a read is a maximum, not a promise: the
+		// host arms its DMA for as much as it wants and stops there.
+		// Hold an unwanted byte a while, then let the rest go.
+		set_data_phase_timeout(attotime::from_usec(500));
 	}
 
 	// the vendor opcodes come as six byte blocks, not the twelve their

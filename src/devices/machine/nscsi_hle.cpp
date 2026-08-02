@@ -58,6 +58,7 @@ const char *const nscsi_full_device::command_names[256] = {
 void nscsi_full_device::device_start()
 {
 	m_scsi_timer = timer_alloc(FUNC(nscsi_full_device::update_tick), this);
+	m_data_timer = timer_alloc(FUNC(nscsi_full_device::data_phase_give_up), this);
 	save_item(NAME(m_status_delayed));
 	save_item(NAME(m_scsi_cmdbuf));
 	save_item(NAME(m_scsi_sense_buffer));
@@ -172,6 +173,7 @@ void nscsi_full_device::step(bool timeout)
 
 	case SEND_BYTE_T_WAIT_ACK_1 << SUB_SHIFT:
 		if(ctrl & S_ACK) {
+			m_data_timer->enable(false);
 			m_scsi_state = (m_scsi_state & STATE_MASK) | (SEND_BYTE_T_WAIT_ACK_0 << SUB_SHIFT);
 			m_scsi_bus->data_w(m_scsi_refid, 0);
 			m_scsi_bus->ctrl_w(m_scsi_refid, 0, S_REQ);
@@ -346,6 +348,24 @@ void nscsi_full_device::target_send_byte(uint8_t val)
 	m_scsi_state = (m_scsi_state & STATE_MASK) | (SEND_BYTE_T_WAIT_ACK_1 << SUB_SHIFT);
 	m_scsi_bus->data_w(m_scsi_refid, val);
 	m_scsi_bus->ctrl_w(m_scsi_refid, S_REQ, S_REQ);
+	// only data gets a deadline; status and messages are short and the
+	// host is always waiting for them
+	if(!m_data_phase_timeout.is_zero() && (m_scsi_state & STATE_MASK) == TARGET_WAIT_DATA_IN_BYTE)
+		m_data_timer->adjust(m_data_phase_timeout);
+	step(false);
+}
+
+TIMER_CALLBACK_MEMBER(nscsi_full_device::data_phase_give_up)
+{
+	// The initiator has stopped acknowledging. Drop the byte it did not
+	// take, abandon what is left of the buffer and go on to whatever was
+	// queued behind the data - status, normally.
+	if((m_scsi_state >> SUB_SHIFT) != SEND_BYTE_T_WAIT_ACK_1)
+		return;
+	m_scsi_bus->data_w(m_scsi_refid, 0);
+	m_scsi_bus->ctrl_w(m_scsi_refid, 0, S_REQ);
+	m_scsi_bus->ctrl_wait(m_scsi_refid, 0, S_ACK);
+	m_scsi_state = TARGET_NEXT_CONTROL;
 	step(false);
 }
 

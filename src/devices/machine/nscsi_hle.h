@@ -537,6 +537,13 @@ protected:
 	// needs it: it polls for REQ to fall after its transfer, and with
 	// the two phases in the same instant that never happens.
 	void set_status_delay(const attotime &t) { m_status_delay = t; }
+	// How long the target will hold a data in byte waiting for an
+	// acknowledge before giving up the rest of the phase. Zero, the
+	// default, waits forever. A host whose transfer length is its own
+	// business - it asks for a number of blocks and takes as much as
+	// its DMA was set up for - leaves the target holding data nobody
+	// will ever collect, and the bus never reaches status.
+	void set_data_phase_timeout(const attotime &t) { m_data_phase_timeout = t; }
 	void scsi_status_complete(uint8_t st);
 	// As scsi_status_complete(), but sends len further bytes in the
 	// message in phase ahead of the command complete message. Targets
@@ -666,6 +673,9 @@ protected:
 	virtual attotime scsi_data_command_delay();
 
 	attotime m_status_delay = attotime::zero;
+	attotime m_data_phase_timeout = attotime::zero;
+	emu_timer *m_data_timer = nullptr;
+	TIMER_CALLBACK_MEMBER(data_phase_give_up);
 	bool m_status_delayed = false;
 	uint8_t m_scsi_cmdbuf[4096];
 	uint8_t m_scsi_sense_buffer[18];
