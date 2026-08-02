@@ -99,7 +99,7 @@ protected:
 		// The sector count in a read is a maximum, not a promise: the
 		// host arms its DMA for as much as it wants and stops there.
 		// Hold an unwanted byte a while, then let the rest go.
-		set_data_phase_timeout(attotime::from_usec(500));
+		set_data_phase_timeout(attotime::from_msec(10));
 	}
 	virtual void scsi_command() override
 	{
@@ -195,7 +195,7 @@ protected:
 		// The sector count in a read is a maximum, not a promise: the
 		// host arms its DMA for as much as it wants and stops there.
 		// Hold an unwanted byte a while, then let the rest go.
-		set_data_phase_timeout(attotime::from_usec(500));
+		set_data_phase_timeout(attotime::from_msec(10));
 	}
 
 	// the vendor opcodes come as six byte blocks, not the twelve their
