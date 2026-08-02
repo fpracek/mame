@@ -318,6 +318,17 @@ protected:
 private:
 	static void floppy_formats(format_registration &fr) { fr.add_pc_formats(); }
 
+	virtual uint8_t scsi_get_data(int id, int pos) override
+	{
+		if (m_sending && id == SBUF_MAIN)
+		{
+			if (pos + 1 >= int(m_data.size()))
+				m_sending = false;
+			return (pos < int(m_data.size())) ? m_data[pos] : 0;
+		}
+		return nscsi_full_device::scsi_get_data(id, pos);
+	}
+
 	void fdc_int_w(int state)
 	{
 		if (!state)
@@ -376,9 +387,14 @@ private:
 
 		if (!m_data.empty())
 		{
-			int const size = std::min<int>(m_data.size(), sizeof(m_scsi_cmdbuf));
-			std::copy_n(m_data.begin(), size, m_scsi_cmdbuf);
-			scsi_data_in(SBUF_MAIN, size);
+			// Sent straight out of this device's own buffer rather than
+			// through the command one: a nine sector track is 4608 bytes
+			// and that only holds 4096. Copying into it lost the last
+			// 512 without a word, the host's DMA sat waiting for them,
+			// and its transfer never finished - which is what stopped
+			// the sixth read.
+			m_sending = true;
+			scsi_data_in(SBUF_MAIN, m_data.size());
 		}
 		// the extended message: the code, the count plus three, three
 		// bytes the firmware steps over, then the results
@@ -400,6 +416,7 @@ private:
 	int m_expected = 0;
 	uint8_t m_fdc_command = 0;
 	bool m_drq = false;
+	bool m_sending = false;
 	bool m_unit_attention = true;
 };
 
