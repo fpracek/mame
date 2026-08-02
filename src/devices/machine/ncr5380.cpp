@@ -781,7 +781,14 @@ void ncr5380_device::scsi_data_w(u8 data)
 	// TODO: release data bus when any of the prerequisite conditions expire
 	u32 const ctrl = m_scsi_bus->ctrl_r();
 
-	if ((m_mode & MODE_TARGET) || (!(ctrl & S_INP) && (ctrl & S_PHASE_MASK) == (m_tcmd & S_PHASE_MASK)))
+	// During selection there is no information transfer phase to match:
+	// the initiator drives the bus from the assert-data-bus bit alone,
+	// and the target command register may still hold the phase of the
+	// transaction before. Firmware that clears that register after
+	// putting the target id out - rather than before, as the phase match
+	// below quietly requires - would otherwise never select anything.
+	if ((m_mode & MODE_TARGET) || (ctrl & S_SEL) ||
+		(!(ctrl & S_INP) && (ctrl & S_PHASE_MASK) == (m_tcmd & S_PHASE_MASK)))
 	{
 		LOGMASKED(LOG_SCSI, "scsi data 0x%02x\n", data);
 		m_scsi_bus->data_w(m_scsi_refid, data);
