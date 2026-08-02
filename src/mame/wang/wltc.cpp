@@ -208,7 +208,7 @@ protected:
 		// and a0 00 06 ... is seven. Fixing the frame at six truncated
 		// the longer ones - the seek lost its cylinder and the specify
 		// its second parameter.
-		if (command >= 0xa0 && command <= 0xa2)
+		if (command >= 0xa0 && command <= 0xa3)
 			return length >= 3 && length == m_scsi_cmdbuf[2] + 1;
 		return nscsi_full_device::scsi_command_done(command, length);
 	}
@@ -260,9 +260,16 @@ protected:
 		{
 			// Asked for once, with room for 36 bytes; a plain SCSI-1
 			// answer, removable direct-access.
+			// Wang puts the removable bit in byte 0, not byte 1: the
+			// floppy driver's init at E17A8 walks the table the device
+			// scan filled and marks a unit usable - the bit 7 the "set
+			// media type" request checks - only for an entry whose
+			// inquiry byte 0 is exactly 0x80, and the boot scan reads a
+			// byte 0 of zero as a fixed disc. The low nibble of byte 1 is
+			// the unit count less one.
 			int const alloc = m_scsi_cmdbuf[4];
 			std::fill_n(m_scsi_cmdbuf, 36, 0);
-			m_scsi_cmdbuf[1] = 0x80;    // removable
+			m_scsi_cmdbuf[0] = 0x80;    // removable direct access
 			m_scsi_cmdbuf[2] = 0x01;    // SCSI-1
 			m_scsi_cmdbuf[3] = 0x01;    // and its inquiry format
 			m_scsi_cmdbuf[4] = 31;      // additional length
@@ -374,6 +381,7 @@ protected:
 
 		case 0xa1:
 		case 0xa2:
+		case 0xa3:
 			// still unread. Good status, no data.
 			m_unit_attention = false;
 			scsi_status_complete(SS_GOOD);
