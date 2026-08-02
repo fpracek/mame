@@ -415,6 +415,7 @@ protected:
 		m_rtc_timer = timer_alloc(FUNC(wltc_state::rtc_periodic), this);
 		m_kb_poll = timer_alloc(FUNC(wltc_state::kb_poll_cb), this);
 		m_dma_timer = timer_alloc(FUNC(wltc_state::dma_service_cb), this);
+
 	}
 	virtual void machine_reset() override ATTR_COLD;
 
