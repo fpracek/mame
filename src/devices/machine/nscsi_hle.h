@@ -531,6 +531,12 @@ protected:
 
 	void handle_request_sense(const u8 lun);
 	void scsi_unknown_command();
+	// Time the target takes to turn the bus round between the end of a
+	// data phase and presenting status. Zero, the default, changes
+	// nothing. A host that watches the bus rather than the controller
+	// needs it: it polls for REQ to fall after its transfer, and with
+	// the two phases in the same instant that never happens.
+	void set_status_delay(const attotime &t) { m_status_delay = t; }
 	void scsi_status_complete(uint8_t st);
 	// As scsi_status_complete(), but sends len further bytes in the
 	// message in phase ahead of the command complete message. Targets
@@ -659,6 +665,8 @@ protected:
 	// Command delay (immediate)
 	virtual attotime scsi_data_command_delay();
 
+	attotime m_status_delay = attotime::zero;
+	bool m_status_delayed = false;
 	uint8_t m_scsi_cmdbuf[4096];
 	uint8_t m_scsi_sense_buffer[18];
 	int m_scsi_cmdsize;

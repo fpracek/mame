@@ -90,6 +90,12 @@ protected:
 	{
 		nscsi_harddisk_device::device_reset();
 		m_unit_attention = true;
+		// After a transfer the start-up code waits at FCA2B for REQ and
+		// ACK to fall before it will look at the status, and gives up
+		// after forty ticks. Turning the bus round in no time at all
+		// puts REQ back up in the same instant and it never sees it low,
+		// so leave the bus quiet for a moment first.
+		set_status_delay(attotime::from_usec(500));
 	}
 	virtual void scsi_command() override
 	{
@@ -179,6 +185,9 @@ protected:
 		// a command, as this used to, gave it none, and every command
 		// came back with the not-ready bit set.
 		m_spin->adjust(attotime::zero);
+		// as on the Winchester: the start-up code wants a moment of quiet
+		// bus between the data and the status
+		set_status_delay(attotime::from_usec(500));
 	}
 
 	// the vendor opcodes come as six byte blocks, not the twelve their

@@ -58,6 +58,7 @@ const char *const nscsi_full_device::command_names[256] = {
 void nscsi_full_device::device_start()
 {
 	m_scsi_timer = timer_alloc(FUNC(nscsi_full_device::update_tick), this);
+	save_item(NAME(m_status_delayed));
 	save_item(NAME(m_scsi_cmdbuf));
 	save_item(NAME(m_scsi_sense_buffer));
 	save_item(NAME(m_scsi_cmdsize));
@@ -197,6 +198,20 @@ void nscsi_full_device::step(bool timeout)
 		// scsi_status_complete() pushes will resume stepping.
 		if(m_buf_control_rpos == m_buf_control_wpos)
 			return;
+
+		// Leave the bus quiet for a moment before presenting status, if
+		// this target has been given a turnaround time. REQ is already
+		// down here - the last byte of the data phase was acknowledged -
+		// so the pause is a window in which a host polling the bus can
+		// see it low.
+		if(!m_status_delay.is_zero() && !m_status_delayed &&
+		   m_buf_control[m_buf_control_rpos].m_action == BC_STATUS) {
+			m_status_delayed = true;
+			m_scsi_timer->adjust(m_status_delay, false);
+			return;
+		}
+		m_status_delayed = false;
+
 		control *ctl = buf_control_pop();
 		switch(ctl->m_action) {
 		case BC_MSG_OR_COMMAND:
