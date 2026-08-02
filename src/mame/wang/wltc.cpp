@@ -1253,7 +1253,19 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		// pulse; everything else reads back what was written, over the
 		// power-on contents in m_rtc.
 		if (m_index_sel == 0x0a)
-			return (machine().time().as_ticks(120) & 1) ? 0x80 : 0x00;
+		{
+			// Bit 7 is UIP, and on the real part it is high for about two
+			// milliseconds once a second, just before the update - not the
+			// square wave this used to be. The POST only needs to see it
+			// pulse, but the clock reader at E1639 selects this register
+			// and spins until the bit is clear before every field it
+			// takes, eight of them per reading: against a bit that is high
+			// half the time at 120Hz a reading cannot finish inside a
+			// tick, and the stage that comes up off the system diskette
+			// spent the whole of its life in that loop.
+			uint64_t const us = machine().time().as_ticks(1'000'000) % 1'000'000;
+			return (us >= 998'000) ? 0x80 : 0x00;
+		}
 		// register C, MC146818-style: interrupt flags, cleared by the
 		// read. The keyboard/RTC ISR counts a periodic interrupt as
 		// genuine only when bits 6 and 0 are both set.
@@ -1520,6 +1532,14 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		m_index_sel = data & 0xff;
 	if ((offset << 1) == 0x2a00)
 	{
+		// Bit 7 of register A is UIP, and on the real part it is status,
+		// not something you can write. The clock reader at E1639 selects
+		// register A and spins until that bit is clear before taking each
+		// field, so handing back whatever was last written there stops the
+		// stage that comes up off the system diskette dead - which is
+		// where it was sitting.
+		if ((m_index_sel & 0x3f) == 0x0a)
+			data &= 0x7f;
 		m_rtc[m_index_sel & 0x3f] = data & 0xff;
 		// register B bit 6, MC146818-style: periodic interrupt enable.
 		// The 1986 POST turns it on with register A = 0x23 (122us rate)
@@ -1643,6 +1663,22 @@ void wltc_state::machine_reset()
 	std::fill(std::begin(m_rtc), std::end(m_rtc), 0);
 	m_rtc[0x10] = 0x01;  // month
 	m_rtc[0x11] = 0x01;  // day
+	// The clock registers proper, left at zero until now. The stage that
+	// comes up off the system diskette reads 6/7/8/9 to keep the date and
+	// turns them into a day number at E1577, and it counts in binary from
+	// a 1980 epoch: the year goes through sub cl,0x50 (80) before being
+	// divided by four against 0x5b5 - 1461, the days in four years. A zero
+	// month and a zero day come out of that as counters of tens of
+	// thousands, and the little sum loop at E15F6 they drive is where the
+	// machine was spending all of its time.
+	m_rtc[0x00] = 0;     // seconds
+	m_rtc[0x02] = 0;     // minutes
+	m_rtc[0x04] = 12;    // hours
+	m_rtc[0x06] = 4;     // day of week
+	m_rtc[0x07] = 1;     // day of month
+	m_rtc[0x08] = 1;     // month
+	m_rtc[0x09] = 86;    // year, 1986
+	m_rtc[0x0d] = 0x80;  // valid RAM and time
 	m_unmapped_value = ioport("UNMAPPED")->read();
 	m_rtc[0x30] = 0xbc;
 	m_rtc[0x31] = 0xfb;
