@@ -157,6 +157,8 @@ class wang_scsi_floppy_device : public nscsi_full_device
 public:
 	wang_scsi_floppy_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0)
 		: nscsi_full_device(mconfig, WANG_SCSI_FLOPPY, tag, owner, clock)
+		, m_fdc(*this, "fdc")
+		, m_drive(*this, "fdc:0")
 	{ }
 
 protected:
@@ -164,6 +166,17 @@ protected:
 	{
 		nscsi_full_device::device_reset();
 		m_unit_attention = true;
+		// the drive spins whenever it has a disk in it - nothing in the
+		// command set switches a motor
+		// no set_floppy(): the controller is configured with its select
+		// lines connected, so it picks the drive from the unit bits of
+		// the command itself
+		floppy_image_device *const f = m_drive->get_device();
+		if (f)
+			f->mon_w(0);
+		logerror("drive A: unita' %s, supporto %s\n",
+				f ? "presente" : "assente",
+				(f && f->exists()) ? "inserito" : "assente");
 	}
 
 	// the vendor opcodes come as six byte blocks, not the twelve their
@@ -219,87 +232,40 @@ protected:
 
 		case 0xa0:
 		{
-			// A floppy-controller command, forwarded. The reply frame is
-			// dictated by FD1E2, which is what unpacks it: the first byte
-			// must be 1, the second is the result count plus three, and
-			// the result bytes themselves start five in. The block that
-			// receives it insists on at least seven bytes.
-			//
-			// This still does not reach the firmware, and now it is clear
-			// why: the result does not come back in the data phase at
-			// all. There is a jump table at FC00:097D indexed by the bus
-			// phase, and each phase has its own buffer - data in reads
-			// into 0x452e, status into 0x4525, and MESSAGE IN into
-			// 0x453c, whose buffer is at 0x4544. That is the one FD1E2
-			// unpacks. And the first byte it insists on, 1, is the SCSI
-			// code for an extended message.
-			//
-			// So the drive answers with the floppy controller's result
-			// bytes as an extended message: 01, the count plus three,
-			// three bytes this firmware steps over, then the results.
-			// Sending that needs a multi-byte message in, and the control
-			// queue that would carry it is private to nscsi_full_device -
-			// a small addition to that class rather than something to
-			// bodge from here.
-			//
-			// The data phase itself works, incidentally: logging both
-			// ends shows the initiator reading 01 05 00 00 ... in step
-			// with this device sending them. It is simply the wrong
-			// phase.
-			//
-			// What will judge it, once it arrives, is FCCA7 onwards: the
-			// sector size in the read id result must be 1, 2 or 3, and
-			// then the cylinder must read back as 4, 2 or 1 - the
-			// firmware seeks to a known track and infers the track
-			// density from the number that comes back, keeping the answer
-			// as a format index in [0x44ee]. Anything else is error 4,
-			// which is the "74 Format Error" on the screen. ST1 carrying
-			// a missing address mark, no data or a data error is the
-			// other way to earn it, at FCDC6.
+			// A floppy-controller command, forwarded to the controller
+			// inside the drive - which is what the drive is: a SCSI
+			// front end on a 765. The command bytes start at 4 and run
+			// for byte 2 minus three, and the results go back as an
+			// extended message; see finish_command.
 			m_unit_attention = false;
-			// the forwarded command starts at byte 4 and runs for
-			// byte 2 minus three
-			uint8_t res[8];
-			int n = 0;
-			switch (m_scsi_cmdbuf[4])
+			int const len = m_scsi_cmdbuf[2] - 3;
+			m_fdc_command = m_scsi_cmdbuf[4];
+			m_data.clear();
+			m_expected = 0;
+			if (m_fdc_command == 0x46 || m_fdc_command == 0x66)
 			{
-			case 0x03: // specify - no result phase on a 765 either
-				break;
-			case 0x07: // recalibrate
-				m_cylinder = 0;
-				res[n++] = 0x20;               // seek end
-				res[n++] = m_cylinder;
-				break;
-			case 0x0f: // seek: the cylinder is the last byte forwarded
-				m_cylinder = m_scsi_cmdbuf[m_scsi_cmdbuf[2]];
-				res[n++] = 0x20;
-				res[n++] = m_cylinder;
-				break;
-			case 0x08: // sense interrupt status
-				res[n++] = 0x20;
-				res[n++] = m_cylinder;
-				break;
-			case 0x4a: // read id
-				res[n++] = 0x00;               // st0
-				res[n++] = 0x00;               // st1
-				res[n++] = 0x00;               // st2
-				res[n++] = m_cylinder;         // cylinder
-				res[n++] = 0x00;               // head
-				res[n++] = 0x01;               // sector
-				res[n++] = 0x02;               // 512 bytes a sector
-				break;
+				// a read: the sector number, the size code and the end
+				// of track say how much is coming
+				int const r = m_scsi_cmdbuf[8];
+				int const sz = m_scsi_cmdbuf[9];
+				int const eot = m_scsi_cmdbuf[10];
+				if (eot >= r)
+					m_expected = (eot - r + 1) * (128 << sz);
 			}
-			// An extended message: the code, then the count plus three,
-			// then three bytes this firmware steps over, then the
-			// results. FD1E2 wants at least seven bytes in the buffer.
-			uint8_t msg[16];
-			int const len = std::max(7, 5 + n);
-			std::fill_n(msg, len, 0);
-			msg[0] = 0x01;
-			msg[1] = n + 3;
-			for (int i = 0; i < n; i++)
-				msg[5 + i] = res[i];
-			scsi_status_complete_msg(SS_GOOD, msg, len);
+			m_fdc->tc_w(false);
+			// keep it spinning: the drive's own reset may have parked it
+			// after ours ran
+			if (floppy_image_device *const f = m_drive->get_device())
+				f->mon_w(0);
+			for (int i = 0; i < len; i++)
+				m_fdc->fifo_w(m_scsi_cmdbuf[4 + i]);
+			// specify neither interrupts nor leaves a result phase, so
+			// there is nothing to wait for
+			if (m_fdc_command == 0x03)
+				finish_command();
+			// everything else answers when the controller interrupts;
+			// pushing nothing here leaves the bus phase parked until it
+			// does
 			return;
 		}
 
@@ -314,17 +280,98 @@ protected:
 		nscsi_full_device::scsi_command();
 	}
 
-	virtual uint8_t scsi_get_data(int id, int pos) override
+	virtual void device_add_mconfig(machine_config &config) override ATTR_COLD
 	{
-		uint8_t const v = nscsi_full_device::scsi_get_data(id, pos);
-		logerror("target consegna dato[%d] = %02x @ %s\n",
-				pos, v, machine().time().as_string(6));
-		return v;
+		UPD765A(config, m_fdc, 8'000'000, true, true);
+		m_fdc->intrq_wr_callback().set(FUNC(wang_scsi_floppy_device::fdc_int_w));
+		m_fdc->drq_wr_callback().set(FUNC(wang_scsi_floppy_device::fdc_drq_w));
+		FLOPPY_CONNECTOR(config, "fdc:0", wltc_floppies, "525dd",
+				floppy_formats).enable_sound(true);
+	}
+
+	virtual void device_start() override ATTR_COLD
+	{
+		nscsi_full_device::device_start();
+		m_drain = timer_alloc(FUNC(wang_scsi_floppy_device::drain), this);
+		save_item(NAME(m_unit_attention));
+		save_item(NAME(m_fdc_command));
+		save_item(NAME(m_expected));
+		save_item(NAME(m_drq));
 	}
 
 private:
+	static void floppy_formats(format_registration &fr) { fr.add_pc_formats(); }
+
+	void fdc_int_w(int state)
+	{
+		if (!state)
+			return;
+		// seek and recalibrate leave no result phase of their own: the
+		// drive has to ask the controller what happened, which is what
+		// a host driver would otherwise do for itself
+		if (m_fdc_command == 0x07 || m_fdc_command == 0x0f)
+			m_fdc->fifo_w(0x08);
+		finish_command();
+	}
+
+	void fdc_drq_w(int state)
+	{
+		m_drq = state;
+		// Not from in here: taking the byte out of the controller's FIFO
+		// from inside its own state machine leaves it unable to finish
+		// the sector. One scheduler slot away costs nothing at these
+		// rates.
+		if (state)
+			m_drain->adjust(attotime::zero);
+	}
+
+	TIMER_CALLBACK_MEMBER(drain)
+	{
+		while (m_drq && (!m_expected || int(m_data.size()) < m_expected))
+			m_data.push_back(m_fdc->dma_r());
+		if (m_expected && int(m_data.size()) >= m_expected)
+			m_fdc->tc_w(true);
+	}
+
+	void finish_command()
+	{
+		uint8_t res[8];
+		int n = 0;
+		while (n < 8 && (m_fdc->msr_r() & 0xd0) == 0xd0)
+			res[n++] = m_fdc->fifo_r();
+
+		std::string txt;
+		for (int i = 0; i < n; i++)
+			txt += util::string_format(" %02x", res[i]);
+		logerror("drive A: comando %02x -> risultato%s, %d byte di dati\n",
+				m_fdc_command, txt, int(m_data.size()));
+
+		if (!m_data.empty())
+		{
+			int const size = std::min<int>(m_data.size(), sizeof(m_scsi_cmdbuf));
+			std::copy_n(m_data.begin(), size, m_scsi_cmdbuf);
+			scsi_data_in(SBUF_MAIN, size);
+		}
+		// the extended message: the code, the count plus three, three
+		// bytes the firmware steps over, then the results
+		uint8_t msg[16];
+		int const len = std::max(7, 5 + n);
+		std::fill_n(msg, len, 0);
+		msg[0] = 0x01;
+		msg[1] = n + 3;
+		for (int i = 0; i < n; i++)
+			msg[5 + i] = res[i];
+		scsi_status_complete_msg(SS_GOOD, msg, len);
+	}
+
+	required_device<upd765a_device> m_fdc;
+	required_device<floppy_connector> m_drive;
+	emu_timer *m_drain = nullptr;
+	std::vector<uint8_t> m_data;
+	int m_expected = 0;
+	uint8_t m_fdc_command = 0;
+	bool m_drq = false;
 	bool m_unit_attention = true;
-	uint8_t m_cylinder = 0;
 };
 
 class wltc_state : public driver_device
