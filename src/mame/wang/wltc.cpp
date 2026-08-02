@@ -170,14 +170,14 @@ protected:
 	// group code would normally mean
 	virtual bool scsi_command_done(uint8_t command, uint8_t length) override
 	{
-		// Six, not the twelve their group code would normally mean.
-		// Byte 2 carries a length of its own - FCE82 builds the block
-		// with the byte count of the floppy command it is forwarding -
-		// but taking that as the CDB length leaves a byte on the bus and
-		// the next command never arrives, so the frame is six and byte 2
-		// counts something inside it.
+		// Not the twelve their group code would normally mean. Byte 2
+		// is a count FCE82 builds from the floppy command it forwards,
+		// and the block runs one byte past it: a0 00 05 ... is six bytes
+		// and a0 00 06 ... is seven. Fixing the frame at six truncated
+		// the longer ones - the seek lost its cylinder and the specify
+		// its second parameter.
 		if (command >= 0xa0 && command <= 0xa2)
-			return length == 6;
+			return length >= 3 && length == m_scsi_cmdbuf[2] + 1;
 		return nscsi_full_device::scsi_command_done(command, length);
 	}
 
@@ -257,6 +257,8 @@ protected:
 			// a missing address mark, no data or a data error is the
 			// other way to earn it, at FCDC6.
 			m_unit_attention = false;
+			// the forwarded command starts at byte 4 and runs for
+			// byte 2 minus three
 			uint8_t res[8];
 			int n = 0;
 			switch (m_scsi_cmdbuf[4])
@@ -264,29 +266,40 @@ protected:
 			case 0x03: // specify - no result phase on a 765 either
 				break;
 			case 0x07: // recalibrate
-			case 0x0f: // seek
-			case 0x08: // sense interrupt status
+				m_cylinder = 0;
 				res[n++] = 0x20;               // seek end
-				res[n++] = 0x00;               // present cylinder
+				res[n++] = m_cylinder;
+				break;
+			case 0x0f: // seek: the cylinder is the last byte forwarded
+				m_cylinder = m_scsi_cmdbuf[m_scsi_cmdbuf[2]];
+				res[n++] = 0x20;
+				res[n++] = m_cylinder;
+				break;
+			case 0x08: // sense interrupt status
+				res[n++] = 0x20;
+				res[n++] = m_cylinder;
 				break;
 			case 0x4a: // read id
 				res[n++] = 0x00;               // st0
 				res[n++] = 0x00;               // st1
 				res[n++] = 0x00;               // st2
-				res[n++] = 0x00;               // cylinder
+				res[n++] = m_cylinder;         // cylinder
 				res[n++] = 0x00;               // head
 				res[n++] = 0x01;               // sector
 				res[n++] = 0x02;               // 512 bytes a sector
 				break;
 			}
+			// An extended message: the code, then the count plus three,
+			// then three bytes this firmware steps over, then the
+			// results. FD1E2 wants at least seven bytes in the buffer.
+			uint8_t msg[16];
 			int const len = std::max(7, 5 + n);
-			std::fill_n(m_scsi_cmdbuf, len, 0);
-			m_scsi_cmdbuf[0] = 0x01;
-			m_scsi_cmdbuf[1] = n + 3;
+			std::fill_n(msg, len, 0);
+			msg[0] = 0x01;
+			msg[1] = n + 3;
 			for (int i = 0; i < n; i++)
-				m_scsi_cmdbuf[5 + i] = res[i];
-			scsi_data_in(SBUF_MAIN, len);
-			scsi_status_complete(SS_GOOD);
+				msg[5 + i] = res[i];
+			scsi_status_complete_msg(SS_GOOD, msg, len);
 			return;
 		}
 
@@ -311,6 +324,7 @@ protected:
 
 private:
 	bool m_unit_attention = true;
+	uint8_t m_cylinder = 0;
 };
 
 class wltc_state : public driver_device

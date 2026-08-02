@@ -410,10 +410,20 @@ nscsi_full_device::control *nscsi_full_device::buf_control_pop()
 
 void nscsi_full_device::scsi_status_complete(uint8_t st)
 {
+	scsi_status_complete_msg(st, nullptr, 0);
+}
+
+void nscsi_full_device::scsi_status_complete_msg(uint8_t st, const uint8_t *msg, int len)
+{
 	control *c;
 	c = buf_control_push();
 	c->m_action = BC_STATUS;
 	c->m_param1 = st;
+	for(int i = 0; i != len; i++) {
+		c = buf_control_push();
+		c->m_action = BC_MESSAGE_1;
+		c->m_param1 = msg[i];
+	}
 	c = buf_control_push();
 	c->m_action = BC_MESSAGE_1;
 	c->m_param1 = SM_COMMAND_COMPLETE;

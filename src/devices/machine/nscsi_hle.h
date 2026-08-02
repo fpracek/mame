@@ -532,6 +532,11 @@ protected:
 	void handle_request_sense(const u8 lun);
 	void scsi_unknown_command();
 	void scsi_status_complete(uint8_t st);
+	// As scsi_status_complete(), but sends len further bytes in the
+	// message in phase ahead of the command complete message. Targets
+	// that answer with a multi-byte message - an extended message, say
+	// - need this; the single-byte path cannot express one.
+	void scsi_status_complete_msg(uint8_t st, const uint8_t *msg, int len);
 	void scsi_data_in(int buf, int size);
 	void scsi_data_out(int buf, int size);
 	void scsi_resume_deferred();
