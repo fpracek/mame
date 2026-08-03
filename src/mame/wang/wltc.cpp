@@ -567,6 +567,10 @@ private:
 	required_shared_ptr<uint16_t> m_textram;
 	required_shared_ptr<uint16_t> m_monoram;
 	bool m_boot_mirror = false;
+	// Video window select and F-segment mapping - see screen_update and
+	// the 0x2d00 / 0x2d02 writes in io_w.
+	uint8_t m_video_window = 0;
+	bool m_fseg_ram = false;
 	std::vector<uint8_t> m_fseg_logged;
 	uint8_t m_ivt_seed_rom[0x240];
 
@@ -989,7 +993,25 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 	// The 1986 BIOS composes its POST messages in the mono buffer at
 	// 0xb0000; the 4.02.03 console uses the colour buffer at 0xb8000.
 	// Render whichever holds text.
+	//
+	// The display the loaded system settles on is neither of those. Its
+	// driver at E4C5:0000 takes the video segment out of the channel
+	// descriptor - 0xf000 for the display channel - selects the window
+	// with 0x2d00 and writes through ES, into the RAM that 0x2d02 puts
+	// behind the F segment. Its cells are the other way round from the
+	// two above: the attribute first and the character second, so the
+	// glyph is the high byte of each word. That buffer is where the Wang
+	// menu draws, and rendering only the other two is what left the
+	// screen frozen on the loader banners while the menu was running.
 	uint16_t const *tbuf = nullptr;
+	int shift = 0;
+	if (m_fseg_ram && m_video_window == 0x0c)
+		for (int i = 0; i < 80 * 25 && !tbuf; i++)
+			if ((m_fram[i] >> 8) > 0x20 && (m_fram[i] >> 8) < 0x7f)
+			{
+				tbuf = m_fram;
+				shift = 8;
+			}
 	for (int i = 0; i < 80 * 25 && !tbuf; i++)
 		if ((m_textram[i] & 0xff) > 0x20 && (m_textram[i] & 0xff) < 0x7f)
 			tbuf = m_textram;
@@ -1008,7 +1030,7 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 			uint32_t *dst = &bitmap.pix(y, cliprect.left());
 			for (int x = cliprect.left(); x <= cliprect.right(); x++)
 			{
-				uint8_t const ch = tbuf[(row * 80) + (x >> 3)] & 0xff;
+				uint8_t const ch = (tbuf[(row * 80) + (x >> 3)] >> shift) & 0xff;
 				uint8_t const bits = m_chargen[(ch << 5) + (line << 1)];
 				// bit 0 is the leftmost pixel, not bit 7: 'L' reads
 				// 0x06 on its upright rows and 'J' 0x78 on its top
@@ -1355,6 +1377,15 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	// this exact port write is unproven - but the switch itself has to
 	// exist, because the same bytes cannot serve as both copy source
 	// and data area.
+	// 0x2d00 is the video window select. The display driver at E4C5:0000
+	// writes it before every character it puts in the F segment and puts
+	// the channel's own value back afterwards; the display channel holds
+	// 0x0c in both places, so the window sits there for good. Everything
+	// else about the register is still unknown - the boot overlay below
+	// happens to hang off the same first write.
+	if ((offset << 1) == 0x2d00 && ACCESSING_BITS_0_7)
+		m_video_window = data & 0xff;
+
 	if ((offset << 1) == 0x2d00 && m_boot_mirror && !machine().side_effects_disabled())
 	{
 		logerror("low overlay -> data template (2d00 write)\n");
@@ -1376,6 +1407,7 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	// the return lands in the test-wiped RAM and marches.
 	if (m_legacy_bios && (offset << 1) == 0x2d02 && !machine().side_effects_disabled())
 	{
+		m_fseg_ram = !(data & 1);
 		if (data & 1)
 			m_maincpu->space(AS_PROGRAM).install_rom(0xf0000, 0xfffff,
 					memregion("bios")->base() + 0x10000);
