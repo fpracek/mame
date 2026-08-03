@@ -1100,7 +1100,21 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 			for (int x = cliprect.left(); x <= cliprect.right(); x++)
 			{
 				uint8_t const ch = (tbuf[(row * 80) + (x >> 3)] >> shift) & 0xff;
-				uint8_t const bits = m_chargen[(ch << 5) + (line << 1)];
+				// The Wang-mode display renders the high codes with the
+				// display micro's own font, which has never been dumped.
+				// The EPROM font we substitute is CP437-flavoured up
+				// there, so the menu marker (0x87) came out as a
+				// c-cedilla and the entry-field fill (0x85) as an
+				// accented a. On the real panel they are a small filled
+				// square and a dot (verified by the machine's owner);
+				// draw those two by hand until the micro's ROM turns up.
+				uint8_t bits;
+				if (shift && ch == 0x87)
+					bits = (line >= 2 && line <= 5) ? 0x3c : 0x00;
+				else if (shift && ch == 0x85)
+					bits = (line == 3 || line == 4) ? 0x18 : 0x00;
+				else
+					bits = m_chargen[(ch << 5) + (line << 1)];
 				// bit 0 is the leftmost pixel, not bit 7: 'L' reads
 				// 0x06 on its upright rows and 'J' 0x78 on its top
 				// row - the other way round every glyph is mirrored
