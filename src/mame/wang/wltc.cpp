@@ -778,8 +778,14 @@ private:
 		// z row
 		{ 0x3f, 0x3e, 0x3d, 0x3c, 0x3b, 0x3a, 0x39, 0x38,
 		  0x37, 0x36, 0, 0, 0, 0, 0, 0 },
-		// EXECUTE and the modifiers
-		{ 0x53, 0x1b, 0x35, 0x24, 0x25, 0, 0, 0,
+		// EXECUTE, the modifiers, and the navigation keys. CANCEL, the
+		// space bar and the up-mover were found by injection and then
+		// isolated one code at a time: from a submenu 0x12 on its own
+		// returns to the main menu exactly as "Press CANCEL to return to
+		// MENUS" promises, 0x2c steps the item selection down the way
+		// the menu's "SPACE BAR - Item Select" does, and 0x2b steps it
+		// up (most likely an arrow key).
+		{ 0x53, 0x1b, 0x35, 0x24, 0x25, 0x12, 0x2c, 0x2b,
 		  0, 0, 0, 0, 0, 0, 0, 0 },
 	};
 	required_ioport_array<5> m_keys;
@@ -2202,6 +2208,9 @@ static INPUT_PORTS_START( wltc )
 	PORT_BIT(0x0004, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Right Shift") PORT_CODE(KEYCODE_RSHIFT)
 	PORT_BIT(0x0008, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Ctrl") PORT_CODE(KEYCODE_LCONTROL)
 	PORT_BIT(0x0010, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Alt") PORT_CODE(KEYCODE_LALT)
+	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("CANCEL") PORT_CODE(KEYCODE_BACKSPACE) PORT_CODE(KEYCODE_DEL)
+	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Space (Item Select)") PORT_CODE(KEYCODE_SPACE) PORT_CODE(KEYCODE_DOWN)
+	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Item Up") PORT_CODE(KEYCODE_UP)
 
 	// experiment switch: what an undecoded port read returns. The 1986
 	// BIOS picks its boot mode from configuration bits (bit 13 of the
