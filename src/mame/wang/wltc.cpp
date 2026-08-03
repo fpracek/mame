@@ -2133,9 +2133,10 @@ void wltc_state::io_map(address_map &map)
 
 
 static INPUT_PORTS_START( wltc )
-	// EXECUTE is on Tab as well as the keypad enter: it is the key the
-	// sign-on screen and the main menu both want, and a laptop keyboard
-	// has no keypad. RETURN is the ordinary enter.
+	// EXECUTE is on the right Alt as well as the keypad enter: it is
+	// the key the sign-on screen and the main menu both want, a laptop
+	// keyboard has no keypad, and Tab belongs to MAME's own UI. The
+	// Wang Alt is on the left Alt only. RETURN is the ordinary enter.
 	//
 	// Keyboard, positional: see KB_CODE in the driver for where the codes
 	// come from. The labels are the QWERTY ones; on a QWERTZ machine y and
@@ -2196,7 +2197,7 @@ static INPUT_PORTS_START( wltc )
 	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("/") PORT_CODE(KEYCODE_SLASH)
 
 	PORT_START("KB4")
-	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("EXECUTE") PORT_CODE(KEYCODE_TAB) PORT_CODE(KEYCODE_ENTER_PAD)
+	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("EXECUTE") PORT_CODE(KEYCODE_RALT) PORT_CODE(KEYCODE_ENTER_PAD)
 	PORT_BIT(0x0002, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Left Shift") PORT_CODE(KEYCODE_LSHIFT)
 	PORT_BIT(0x0004, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Right Shift") PORT_CODE(KEYCODE_RSHIFT)
 	PORT_BIT(0x0008, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Ctrl") PORT_CODE(KEYCODE_LCONTROL)
