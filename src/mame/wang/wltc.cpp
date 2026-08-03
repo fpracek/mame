@@ -1578,10 +1578,25 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		// strobes it and then sends its byte; the one the stage after the
 		// POST installs at FD35F strobes it and re-reads 0x2b02 in a
 		// loop, leaving only when bit 0 has gone - so the strobe has to
-		// clear that bit, and the bit must not come back on its own or
-		// the loop never ends.
+		// clear that bit, and the bit must not come back before that loop
+		// has read it low.
+		//
+		// But it does have to come back. The micro is ready for another
+		// byte a moment after taking one, and equally a moment after an
+		// acknowledge that sent nothing - which is what the console
+		// handler does whenever its output ring happens to be empty
+		// (E000:137C). Re-arming only on a byte actually written, as this
+		// used to, meant the first empty acknowledge took transmit-ready
+		// away for good: the ring filled and never drained again, and
+		// everything the loaded system tried to print after that point
+		// vanished. The poll runs every 200us, which is thousands of
+		// instructions after the strobe - long enough for the wait loop
+		// to have seen the bit low and left.
 		if (m_legacy_bios)
+		{
 			m_kb_status &= ~0x01;
+			m_kb_ready_again = true;
+		}
 		m_kb_reply = 0xfa;
 		m_kb_timer->adjust(attotime::from_usec(200));
 		logerror("kb cmd %02x -> reply irq scheduled\n", data & 0xff);
