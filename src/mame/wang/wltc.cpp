@@ -801,8 +801,13 @@ private:
 		// discards the input line, which is why it masqueraded as a
 		// backslash key for a while. 0x1e is the 2ND shift, the fifth
 		// entry of the modifier-filter table.
+		// 0x54 is a dead entry in the stock translation table; every
+		// layout script repoints it at internal number 0x42, the bracket
+		// family's backslash cell, which no Wang key reaches on its own.
+		// That gives the PC backslash key a real backslash (and pipe on
+		// shift) while the backtick key keeps its backtick.
 		{ 0x53, 0x1b, 0x35, 0x24, 0x25, 0x12, 0x2c, 0x2b,
-		  0x1a, 0x1e, 0x33, 0, 0, 0, 0, 0 },
+		  0x1a, 0x1e, 0x33, 0x54, 0, 0, 0, 0 },
 	};
 	required_ioport_array<5> m_keys;
 	uint16_t m_kb_seen[5] = { 0, 0, 0, 0, 0 };
@@ -2243,7 +2248,8 @@ static INPUT_PORTS_START( wltc )
 	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Backspace (Item Up)") PORT_CODE(KEYCODE_BACKSPACE) PORT_CODE(KEYCODE_UP)
 	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("ESC (Wang)") PORT_CODE(KEYCODE_END)
 	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("2ND") PORT_CODE(KEYCODE_RCONTROL)
-	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("` (backtick)") PORT_CODE(KEYCODE_BACKSLASH) PORT_CODE(KEYCODE_TILDE)
+	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("` (backtick)") PORT_CODE(KEYCODE_TILDE)
+	PORT_BIT(0x0800, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("\\") PORT_CODE(KEYCODE_BACKSLASH)
 
 	// experiment switch: what an undecoded port read returns. The 1986
 	// BIOS picks its boot mode from configuration bits (bit 13 of the
