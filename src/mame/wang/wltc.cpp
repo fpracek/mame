@@ -771,9 +771,11 @@ private:
 		// PC minus position is '=' (0x64, echo-verified).
 		{ 0x6e, 0x6d, 0x6c, 0x6b, 0x6a, 0x69, 0x68, 0x67,
 		  0x66, 0x65, 0x13, 0x64, 0, 0, 0, 0 },
-		// q row
+		// q row. The ']' is 0x21 - internal number 0x41, second of the
+		// bracket family; 0x54, extrapolated from the row pattern,
+		// types nothing.
 		{ 0x5f, 0x5e, 0x5d, 0x5c, 0x5b, 0x5a, 0x59, 0x58,
-		  0x57, 0x56, 0x55, 0x54, 0, 0, 0, 0 },
+		  0x57, 0x56, 0x55, 0x21, 0, 0, 0, 0 },
 		// a row, with RETURN at its right-hand end
 		{ 0x4f, 0x4e, 0x4d, 0x4c, 0x4b, 0x4a, 0x49, 0x48,
 		  0x47, 0x46, 0x45, 0x44, 0, 0, 0, 0 },
@@ -795,8 +797,12 @@ private:
 		// machine's backtick key (0x33) is left out: repointing it in
 		// the layout scripts froze the console output after one echo,
 		// and no layout needs it badly enough to chase that down.
+		// 0x1a is the machine's ESC - DOS echoes it as a backslash and
+		// discards the input line, which is why it masqueraded as a
+		// backslash key for a while. 0x1e is the 2ND shift, the fifth
+		// entry of the modifier-filter table.
 		{ 0x53, 0x1b, 0x35, 0x24, 0x25, 0x12, 0x2c, 0x2b,
-		  0x1a, 0, 0, 0, 0, 0, 0, 0 },
+		  0x1a, 0x1e, 0x33, 0, 0, 0, 0, 0 },
 	};
 	required_ioport_array<5> m_keys;
 	uint16_t m_kb_seen[5] = { 0, 0, 0, 0, 0 };
@@ -2235,7 +2241,9 @@ static INPUT_PORTS_START( wltc )
 	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("CANCEL") PORT_CODE(KEYCODE_DEL)
 	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Space (Item Select)") PORT_CODE(KEYCODE_SPACE) PORT_CODE(KEYCODE_DOWN)
 	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Backspace (Item Up)") PORT_CODE(KEYCODE_BACKSPACE) PORT_CODE(KEYCODE_UP)
-	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("\\") PORT_CODE(KEYCODE_BACKSLASH) PORT_CODE(KEYCODE_TILDE)
+	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("ESC (Wang)") PORT_CODE(KEYCODE_END)
+	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("2ND") PORT_CODE(KEYCODE_RCONTROL)
+	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("` (backtick)") PORT_CODE(KEYCODE_BACKSLASH) PORT_CODE(KEYCODE_TILDE)
 
 	// experiment switch: what an undecoded port read returns. The 1986
 	// BIOS picks its boot mode from configuration bits (bit 13 of the
