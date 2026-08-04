@@ -55,6 +55,7 @@
 // The driver's own SCSI devices, defined at the bottom of this file
 extern emu::detail::device_type_impl<nscsi_harddisk_device> const WANG_WINCHESTER;
 extern emu::detail::device_type_impl<nscsi_full_device> const WANG_SCSI_FLOPPY;
+extern emu::detail::device_type_impl<nscsi_full_device> const WANG_SCSI_FLOPPY35;
 
 namespace {
 
@@ -136,6 +137,7 @@ private:
 static void wltc_floppies(device_slot_interface &device)
 {
 	device.option_add("525dd", FLOPPY_525_DD);
+	device.option_add("35dd", FLOPPY_35_DD);
 }
 
 // ---------------------------------------------------------------------
@@ -166,7 +168,12 @@ class wang_scsi_floppy_device : public nscsi_full_device
 {
 public:
 	wang_scsi_floppy_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0)
-		: nscsi_full_device(mconfig, WANG_SCSI_FLOPPY, tag, owner, clock)
+		: wang_scsi_floppy_device(mconfig, WANG_SCSI_FLOPPY, tag, owner, clock)
+	{ }
+
+protected:
+	wang_scsi_floppy_device(const machine_config &mconfig, device_type type, const char *tag, device_t *owner, uint32_t clock)
+		: nscsi_full_device(mconfig, type, tag, owner, clock)
 		, m_fdc(*this, "fdc")
 		, m_drive(*this, "fdc:0")
 	{ }
@@ -396,9 +403,12 @@ protected:
 		UPD765A(config, m_fdc, 8'000'000, true, true);
 		m_fdc->intrq_wr_callback().set(FUNC(wang_scsi_floppy_device::fdc_int_w));
 		m_fdc->drq_wr_callback().set(FUNC(wang_scsi_floppy_device::fdc_drq_w));
-		FLOPPY_CONNECTOR(config, "fdc:0", wltc_floppies, "525dd",
+		FLOPPY_CONNECTOR(config, "fdc:0", wltc_floppies, drive_default(),
 				floppy_formats).enable_sound(true);
 	}
+
+	// which drive sits in the enclosure: the 3.5" variant overrides it
+	virtual const char *drive_default() const { return "525dd"; }
 
 	virtual void device_start() override ATTR_COLD
 	{
@@ -2332,15 +2342,20 @@ void wltc_state::wltc(machine_config &config)
 	// NCR 53C80 SCSI bus at 0x2700: the JVC Winchester sits on it, and
 	// so does the external floppy drive
 	nscsi_bus_device &scsibus(NSCSI_BUS(config, "scsi"));
-	nscsi_connector &winchester(NSCSI_CONNECTOR(config, "scsi:0"));
-	winchester.option_add("winchester", WANG_WINCHESTER);
-	winchester.set_default_option("winchester");
-	// The external floppy drive, drive A. Not fitted by default: it is
-	// still a listening post rather than a drive, and the start-up code
-	// tries drive A before anything else, so fitting it takes priority
-	// away from the paths that do work. Enable it with -scsi:1 wangfdd.
-	nscsi_connector &fdd(NSCSI_CONNECTOR(config, "scsi:1"));
-	fdd.option_add("wangfdd", WANG_SCSI_FLOPPY);
+	// Seven device positions, ids 0 to 6, all free: on the real machine
+	// the internal Winchester is id 0, the 3.5" enclosure is wired to
+	// id 1 (drive A), and the 5.25" boxes carry a selector switch - up
+	// to the full bus of drives. Only the Winchester is fitted by
+	// default; add drives with e.g. -scsi:1 wangfdd35 -scsi:2 wangfdd.
+	for (int id = 0; id <= 6; id++)
+	{
+		nscsi_connector &conn(NSCSI_CONNECTOR(config, util::string_format("scsi:%d", id).c_str()));
+		conn.option_add("winchester", WANG_WINCHESTER);
+		conn.option_add("wangfdd", WANG_SCSI_FLOPPY);
+		conn.option_add("wangfdd35", WANG_SCSI_FLOPPY35);
+		if (id == 0)
+			conn.set_default_option("winchester");
+	}
 	NCR5380(config, m_scsi);
 	scsibus.set_external_device(7, m_scsi);
 	m_scsi->irq_handler().set(FUNC(wltc_state::scsi_int_w));
@@ -2448,7 +2463,22 @@ ROM_END
 } // anonymous namespace
 
 DEFINE_DEVICE_TYPE_PRIVATE(WANG_WINCHESTER, nscsi_harddisk_device, wang_winchester_device, "wang_winchester", "Wang LapTop Winchester")
+// The 3.5" enclosure: on the real machine it is the drive wired to
+// SCSI ID 1 - drive A - while the 5.25" box has a selector switch.
+// Same bridge, different mechanism.
+class wang_scsi_floppy35_device : public wang_scsi_floppy_device
+{
+public:
+	wang_scsi_floppy35_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0)
+		: wang_scsi_floppy_device(mconfig, WANG_SCSI_FLOPPY35, tag, owner, clock)
+	{ }
+
+protected:
+	virtual const char *drive_default() const override { return "35dd"; }
+};
+
 DEFINE_DEVICE_TYPE_PRIVATE(WANG_SCSI_FLOPPY, nscsi_full_device, wang_scsi_floppy_device, "wang_scsi_floppy", "Wang LapTop external floppy drive")
+DEFINE_DEVICE_TYPE_PRIVATE(WANG_SCSI_FLOPPY35, nscsi_full_device, wang_scsi_floppy35_device, "wang_scsi_floppy35", "Wang LapTop external floppy drive (3.5\")")
 
 
 //    YEAR  NAME  PARENT  COMPAT  MACHINE  INPUT  CLASS       INIT        COMPANY              FULLNAME               FLAGS
