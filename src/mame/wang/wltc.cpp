@@ -809,8 +809,11 @@ private:
 		// and no layout needs it badly enough to chase that down.
 		// 0x1a is the machine's ESC - DOS echoes it as a backslash and
 		// discards the input line, which is why it masqueraded as a
-		// backslash key for a while. 0x1e is the 2ND shift, the fifth
-		// entry of the modifier-filter table.
+		// backslash key for a while. 0x1e is CAPS LOCK: it is the fifth
+		// entry of the modifier-filter table, the one that had no name,
+		// and typing after it settles the question - abc, press, ABC,
+		// press again, abc. The real machine has the key, so the host's
+		// Caps Lock must reach it (right Ctrl answers as well).
 		// 0x54 is a dead entry in the stock translation table; every
 		// layout script repoints it at internal number 0x42, the bracket
 		// family's backslash cell, which no Wang key reaches on its own.
@@ -2257,7 +2260,7 @@ static INPUT_PORTS_START( wltc )
 	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Space (Item Select)") PORT_CODE(KEYCODE_SPACE) PORT_CODE(KEYCODE_DOWN)
 	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Backspace (Item Up)") PORT_CODE(KEYCODE_BACKSPACE) PORT_CODE(KEYCODE_UP)
 	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("ESC (Wang)") PORT_CODE(KEYCODE_END)
-	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("2ND") PORT_CODE(KEYCODE_RCONTROL)
+	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Caps Lock") PORT_CODE(KEYCODE_CAPSLOCK) PORT_CODE(KEYCODE_RCONTROL)
 	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("` (backtick)") PORT_CODE(KEYCODE_TILDE)
 	PORT_BIT(0x0800, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("\\") PORT_CODE(KEYCODE_BACKSLASH)
 
