@@ -790,8 +790,13 @@ private:
 		// 0x2b is the machine's BACKSPACE: it rubs out at the DOS
 		// prompt, and the menus use it to step the selection up - the
 		// same code serves both. 0x1a is backslash, 0x33 backtick.
+		// The backslash key answers both the PC backslash and the key
+		// left of the 1 (the Italian layout puts backslash there). The
+		// machine's backtick key (0x33) is left out: repointing it in
+		// the layout scripts froze the console output after one echo,
+		// and no layout needs it badly enough to chase that down.
 		{ 0x53, 0x1b, 0x35, 0x24, 0x25, 0x12, 0x2c, 0x2b,
-		  0x1a, 0x33, 0, 0, 0, 0, 0, 0 },
+		  0x1a, 0, 0, 0, 0, 0, 0, 0 },
 	};
 	required_ioport_array<5> m_keys;
 	uint16_t m_kb_seen[5] = { 0, 0, 0, 0, 0 };
@@ -2230,8 +2235,7 @@ static INPUT_PORTS_START( wltc )
 	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("CANCEL") PORT_CODE(KEYCODE_DEL)
 	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Space (Item Select)") PORT_CODE(KEYCODE_SPACE) PORT_CODE(KEYCODE_DOWN)
 	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Backspace (Item Up)") PORT_CODE(KEYCODE_BACKSPACE) PORT_CODE(KEYCODE_UP)
-	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("\\") PORT_CODE(KEYCODE_BACKSLASH)
-	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("`") PORT_CODE(KEYCODE_TILDE)
+	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("\\") PORT_CODE(KEYCODE_BACKSLASH) PORT_CODE(KEYCODE_TILDE)
 
 	// experiment switch: what an undecoded port read returns. The 1986
 	// BIOS picks its boot mode from configuration bits (bit 13 of the
