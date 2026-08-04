@@ -766,18 +766,20 @@ private:
 	// Being positional it holds for QWERTZ as well: the label changes,
 	// the code does not.
 	static inline constexpr uint8_t KB_CODE[5][16] = {
-		// digits, left to right
+		// digits, left to right. The '-' comes from the keypad key,
+		// which carries the same character; the machine's own key at the
+		// PC minus position is '=' (0x64, echo-verified).
 		{ 0x6e, 0x6d, 0x6c, 0x6b, 0x6a, 0x69, 0x68, 0x67,
-		  0x66, 0x65, 0x64, 0x63, 0, 0, 0, 0 },
+		  0x66, 0x65, 0x13, 0x64, 0, 0, 0, 0 },
 		// q row
 		{ 0x5f, 0x5e, 0x5d, 0x5c, 0x5b, 0x5a, 0x59, 0x58,
 		  0x57, 0x56, 0x55, 0x54, 0, 0, 0, 0 },
 		// a row, with RETURN at its right-hand end
 		{ 0x4f, 0x4e, 0x4d, 0x4c, 0x4b, 0x4a, 0x49, 0x48,
 		  0x47, 0x46, 0x45, 0x44, 0, 0, 0, 0 },
-		// z row
+		// z row. Echo-verified: 0x38 ',', 0x2a '.', 0x37 '/'.
 		{ 0x3f, 0x3e, 0x3d, 0x3c, 0x3b, 0x3a, 0x39, 0x38,
-		  0x37, 0x36, 0, 0, 0, 0, 0, 0 },
+		  0x2a, 0x37, 0, 0, 0, 0, 0, 0 },
 		// EXECUTE, the modifiers, and the navigation keys. CANCEL, the
 		// space bar and the up-mover were found by injection and then
 		// isolated one code at a time: from a submenu 0x12 on its own
@@ -785,8 +787,11 @@ private:
 		// MENUS" promises, 0x2c steps the item selection down the way
 		// the menu's "SPACE BAR - Item Select" does, and 0x2b steps it
 		// up (most likely an arrow key).
+		// 0x2b is the machine's BACKSPACE: it rubs out at the DOS
+		// prompt, and the menus use it to step the selection up - the
+		// same code serves both. 0x1a is backslash, 0x33 backtick.
 		{ 0x53, 0x1b, 0x35, 0x24, 0x25, 0x12, 0x2c, 0x2b,
-		  0, 0, 0, 0, 0, 0, 0, 0 },
+		  0x1a, 0x33, 0, 0, 0, 0, 0, 0 },
 	};
 	required_ioport_array<5> m_keys;
 	uint16_t m_kb_seen[5] = { 0, 0, 0, 0, 0 };
@@ -2222,9 +2227,11 @@ static INPUT_PORTS_START( wltc )
 	PORT_BIT(0x0004, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Right Shift") PORT_CODE(KEYCODE_RSHIFT)
 	PORT_BIT(0x0008, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Ctrl") PORT_CODE(KEYCODE_LCONTROL)
 	PORT_BIT(0x0010, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Alt") PORT_CODE(KEYCODE_LALT)
-	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("CANCEL") PORT_CODE(KEYCODE_BACKSPACE) PORT_CODE(KEYCODE_DEL)
+	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("CANCEL") PORT_CODE(KEYCODE_DEL)
 	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Space (Item Select)") PORT_CODE(KEYCODE_SPACE) PORT_CODE(KEYCODE_DOWN)
-	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Item Up") PORT_CODE(KEYCODE_UP)
+	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Backspace (Item Up)") PORT_CODE(KEYCODE_BACKSPACE) PORT_CODE(KEYCODE_UP)
+	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("\\") PORT_CODE(KEYCODE_BACKSLASH)
+	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("`") PORT_CODE(KEYCODE_TILDE)
 
 	// experiment switch: what an undecoded port read returns. The 1986
 	// BIOS picks its boot mode from configuration bits (bit 13 of the
