@@ -1629,6 +1629,21 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		return;
 	}
 
+	// The interrupt controller is an 8259, and 0x2200/0x2202 are its
+	// command and data ports. The BIOS initialises it the canonical way -
+	// ICW1 0x1f to 0x2200, then 0x80, 0x0d, 0x00 to 0x2202 - which is
+	// where the vector base of 0x80 comes from, and the "0xe0 + n" the
+	// diagnostic's handlers write is a rotate-on-specific-EOI, not a Wang
+	// invention.
+	//
+	// The device gets the writes so its command and mask state is real.
+	// The sources still reach the CPU the old way for now: moving them
+	// onto the IR lines has to happen in one piece, and the machine has
+	// to keep booting in between.
+	if (m_legacy_bios && ACCESSING_BITS_0_7
+			&& ((offset << 1) == 0x2200 || (offset << 1) == 0x2202))
+		m_pic->write(((offset << 1) == 0x2200) ? 0 : 1, data & 0xff);
+
 	if ((offset << 1) == 0x2202)
 	{
 		m_int_enable_2202 = data & 0xff;
