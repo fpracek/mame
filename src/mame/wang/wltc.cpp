@@ -1106,21 +1106,57 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 	// glyph is the high byte of each word. That buffer is where the Wang
 	// menu draws, and rendering only the other two is what left the
 	// screen frozen on the loader banners while the menu was running.
+	// Which of them is live is decided by looking at all three and
+	// scoring the cells, because the first-one-that-looks-like-text rule
+	// this replaces was fooled by data: the diagnostic utility keeps its
+	// message table in the F segment, and read as characters it looks
+	// exactly like a screen. A cell only counts when the character is
+	// printable AND its companion byte is a plausible attribute - on a
+	// monochrome panel that means each nibble is 0 or 7, leaving the
+	// bright and blink bits free. Message-table bytes fail that at once:
+	// their "attributes" are just more text. Measured: the diagnostic
+	// screen scores 890 cells with attributes 00 and 08, the boot banner
+	// 194 with 07, and a table of prose scores nothing.
+	auto const attr_ok = [] (uint8_t a)
+	{
+		return ((a & 0x07) == 0x00 || (a & 0x07) == 0x07)
+			&& ((a & 0x70) == 0x00 || (a & 0x70) == 0x70);
+	};
+	auto const score = [&attr_ok] (uint16_t const *buf, int sh)
+	{
+		int n = 0;
+		for (int i = 0; i < 80 * 25; i++)
+		{
+			uint8_t const ch = (buf[i] >> sh) & 0xff;
+			uint8_t const at = (buf[i] >> (8 - sh)) & 0xff;
+			if (ch > 0x20 && ch < 0x7f && attr_ok(at))
+				n++;
+		}
+		return n;
+	};
+
 	uint16_t const *tbuf = nullptr;
 	int shift = 0;
-	if (m_fseg_ram && m_video_window == 0x0c)
-		for (int i = 0; i < 80 * 25 && !tbuf; i++)
-			if ((m_fram[i] >> 8) > 0x20 && (m_fram[i] >> 8) < 0x7f)
-			{
-				tbuf = m_fram;
-				shift = 8;
-			}
-	for (int i = 0; i < 80 * 25 && !tbuf; i++)
-		if ((m_textram[i] & 0xff) > 0x20 && (m_textram[i] & 0xff) < 0x7f)
-			tbuf = m_textram;
-	for (int i = 0; i < 80 * 25 && !tbuf; i++)
-		if ((m_monoram[i] & 0xff) > 0x20 && (m_monoram[i] & 0xff) < 0x7f)
-			tbuf = m_monoram;
+	int best = 40;   // below this it is noise, not a screen
+	// The Wang display's cells are the other way round from the two PC
+	// buffers - attribute first, character second - so its glyph is the
+	// high byte. The window register at 0x2d00 does not choose between
+	// them: the display driver writes it before every character and puts
+	// the channel's value back, and the diagnostic runs with it on 0x06
+	// while drawing into the same F segment the menu uses at 0x0c.
+	if (m_fseg_ram)
+	{
+		int const n = score(m_fram, 8);
+		if (n > best) { best = n; tbuf = m_fram; shift = 8; }
+	}
+	{
+		int const n = score(m_textram, 0);
+		if (n > best) { best = n; tbuf = m_textram; shift = 0; }
+	}
+	{
+		int const n = score(m_monoram, 0);
+		if (n > best) { best = n; tbuf = m_monoram; shift = 0; }
+	}
 
 	if (tbuf)
 	{
