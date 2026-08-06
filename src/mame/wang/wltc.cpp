@@ -1013,14 +1013,18 @@ private:
 		// at moving the sources onto the controller failed on that wire,
 		// not on the code they changed: the log showed ir0 acknowledged
 		// while this driver's own shadow said no line was up.
-		if (!m_legacy_bios)
+		if (N == 0)
 		{
-			if (N == 0)
-				m_pic->ir0_w(state);
+			// Counter 0 still reaches the controller's ir0 as it always did.
+			// Cutting it off under the 1986 BIOS was meant to stop it flooding
+			// the controller once the sources are handed over - harmless while
+			// they are not, but it is the only behavioural change among the
+			// recent commits, and the DOS command processor stopped starting
+			// for the machine's owner right after them. Restored until that is
+			// understood; the handover work will have to gate it another way.
+			m_pic->ir0_w(state);
 			return;
 		}
-		if (N == 0)
-			return;   // the 1986 tick comes through its own path
 		// the counter output is a level: the request follows it
 		set_source(N - 1, state != 0);
 	}
