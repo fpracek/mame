@@ -718,6 +718,58 @@ private:
 		if (!m_legacy_bios)
 			m_maincpu->set_input_line(0, state ? ASSERT_LINE : CLEAR_LINE);
 	}
+	// Sources as states rather than pulses.
+	//
+	// Every source in this driver raises its request and never lowers it:
+	// with a pulse to the CPU that was enough, because nobody ever asked
+	// whether the request was still there. An 8259 does ask - the BIOS
+	// programs it level triggered - and a request that never falls comes
+	// straight back after each acknowledge. That is what starved the POST
+	// when the controller was given charge of the interrupts.
+	//
+	// So a source now says what its state IS, and the line follows in both
+	// directions. While the old fixed-vector path is the one delivering,
+	// only the rising edge matters and set_source behaves exactly as
+	// before; the moment the 8259 takes over, the falling edge is there
+	// too. m_source_state is what the two paths share.
+	uint8_t m_source_state = 0;
+	bool m_pic_ready = false;
+
+	void pic_ir(int n, int state)
+	{
+		switch (n & 7)
+		{
+		case 0: m_pic->ir0_w(state); break;
+		case 1: m_pic->ir1_w(state); break;
+		case 2: m_pic->ir2_w(state); break;
+		case 3: m_pic->ir3_w(state); break;
+		case 4: m_pic->ir4_w(state); break;
+		case 5: m_pic->ir5_w(state); break;
+		case 6: m_pic->ir6_w(state); break;
+		case 7: m_pic->ir7_w(state); break;
+		}
+	}
+
+	void set_source(int n, bool state)
+	{
+		bool const was = BIT(m_source_state, n);
+		if (state)
+			m_source_state |= 1 << n;
+		else
+			m_source_state &= ~(1 << n);
+		if (m_pic_ready)
+		{
+			pic_ir(n, state);
+			return;
+		}
+		// old path: the request is a pulse on the rising edge, and only
+		// when the source is unmasked
+		if (state && !was && m_legacy_bios && !BIT(m_int_enable_2202, n))
+		{
+			m_gate_vector = m_vector_base + n;
+			m_maincpu->set_input_line(0, HOLD_LINE);
+		}
+	}
 	// The 1986 gate-array interrupt scheme: sources are hard-vectored
 	// (counter 1 -> 0x20, counter 2 -> 0x21, keyboard -> 0x25), each
 	// enabled by an active-low bit in port 0x2202 (0/1/5). The POST
@@ -908,20 +960,14 @@ private:
 		m_rtc[0x0c] |= 0x41;
 		logerror("RTC tick @ %s (2202=%02x)\n",
 				machine().time().as_string(6), m_int_enable_2202);
-		if (m_legacy_bios && !BIT(m_int_enable_2202, 5))
-		{
-			m_gate_vector = m_vector_base + 5;
-			m_maincpu->set_input_line(0, HOLD_LINE);
-		}
+		if (m_legacy_bios)
+			set_source(5, true);
 	}
 	template <int N>
 	void pit_out_w(int state)
 	{
-		if (m_legacy_bios && state && !BIT(m_int_enable_2202, N - 1))
-		{
-			m_gate_vector = m_vector_base + (N - 1);
-			m_maincpu->set_input_line(0, HOLD_LINE);
-		}
+		// the counter output is a level: the request follows it
+		set_source(N - 1, state != 0);
 	}
 	// ---------------------------------------------------------------
 	// Wang DMA controller (0x2300-0x230f)
@@ -1448,6 +1494,8 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		{
 			uint8_t const v = m_rtc[0x0c];
 			m_rtc[0x0c] = 0;
+			// reading register C clears the flags, and with them the request
+			set_source(5, false);
 			logerror("RTC regC read = %02x @ %s\n", v, machine().time().as_string(6));
 			return v;
 		}
