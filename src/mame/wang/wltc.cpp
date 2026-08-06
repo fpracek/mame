@@ -643,7 +643,11 @@ private:
 	// what the gate array does and what the firmware counts on.
 	void scsi_int_update()
 	{
-		if (m_legacy_bios && m_scsi_irq && !BIT(m_int_enable_2202, 3))
+		if (m_pic_ready)
+		{
+			update_line3();
+		}
+		else if (m_legacy_bios && m_scsi_irq && !BIT(m_int_enable_2202, 3))
 		{
 			m_gate_vector = m_vector_base + 3;
 			m_maincpu->set_input_line(0, HOLD_LINE);
@@ -733,6 +737,15 @@ private:
 	// before; the moment the 8259 takes over, the falling edge is there
 	// too. m_source_state is what the two paths share.
 	uint8_t m_source_state = 0;
+	// Line 3 is shared by the SCSI controller, the floppy controller and the
+	// end of a DMA transfer: the first two are states the devices hold, the
+	// third a pulse, cleared when the handler reads the status word at 0x2b0a.
+	bool m_dma_done = false;
+
+	void update_line3()
+	{
+		set_source(3, m_scsi_irq || m_fdc_int || m_dma_done);
+	}
 	bool m_pic_ready = false;
 
 	void pic_ir(int n, int state)
@@ -967,7 +980,13 @@ private:
 			m_kb_status |= 0x01;
 			m_kb_ready_again = false;
 		}
-		if ((m_kb_status & 0x03) && !BIT(m_int_enable_2202, 2))
+		if (m_pic_ready)
+		{
+			// the request is the byte waiting to be read: bit 0, ready to
+			// accept, never clears and so cannot hold a level
+			set_source(2, (m_kb_status & 0x02) != 0);
+		}
+		else if ((m_kb_status & 0x03) && !BIT(m_int_enable_2202, 2))
 		{
 			m_gate_vector = m_vector_base + 2;
 			m_maincpu->set_input_line(0, HOLD_LINE);
@@ -1117,7 +1136,12 @@ private:
 		}
 		logerror("DMA complete, end address %05x\n", m_dma_addr);
 		// vector 0x23, unmasked by bit 3 of 0x2202 (active low)
-		if (m_legacy_bios && !BIT(m_int_enable_2202, 3))
+		if (m_pic_ready)
+		{
+			m_dma_done = true;
+			update_line3();
+		}
+		else if (m_legacy_bios && !BIT(m_int_enable_2202, 3))
 		{
 			m_gate_vector = m_vector_base + 3;
 			m_maincpu->set_input_line(0, HOLD_LINE);
@@ -1136,7 +1160,11 @@ private:
 		// The floppy shares the DMA source: the vector 0x83 handler at
 		// FD31E checks 0x2b0a for the DMA and the SCSI, and failing both
 		// reads 0x2b02 and services the controller on bit 5.
-		if (state && m_legacy_bios && !BIT(m_int_enable_2202, 3))
+		if (m_pic_ready)
+		{
+			update_line3();
+		}
+		else if (state && m_legacy_bios && !BIT(m_int_enable_2202, 3))
 		{
 			m_gate_vector = m_vector_base + 3;
 			m_maincpu->set_input_line(0, HOLD_LINE);
@@ -1419,6 +1447,13 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	// at F1244 ever tests). It has to be an event flag, not the constant
 	// it used to be here, or every SCSI interrupt would also report a
 	// completed transfer.
+	if ((offset << 1) == 0x2b0a && m_pic_ready && m_dma_done
+			&& !machine().side_effects_disabled())
+	{
+		m_dma_done = false;
+		update_line3();
+	}
+
 	if ((offset << 1) == 0x2b0a)
 		return 0xc7db | ((m_scsi_rst_irq || m_scsi_irq) ? 0x0004 : 0) | (m_dma_tc ? 0x0020 : 0);
 
@@ -1542,7 +1577,11 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		if (m_legacy_bios)
 		{
 			if (!machine().side_effects_disabled())
-				m_kb_status &= ~0x02;
+				{
+					m_kb_status &= ~0x02;
+					if (m_pic_ready)
+						set_source(2, false);
+				}
 			return m_kb_rx;
 		}
 		return 0x0044; // handshake status, bit7 = busy, measured idle
