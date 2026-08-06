@@ -581,6 +581,18 @@ private:
 	// Video window select and F-segment mapping - see screen_update and
 	// the 0x2d00 / 0x2d02 writes in io_w.
 	uint8_t m_video_window = 0;
+	// System-mode register 0x2e1e and display-source register 0x2e06,
+	// measured with logged SYSMODE runs (w/m/w/c/w). Bit 3 of 0x2e1e is
+	// the Wang / Industry Standard switch: the console rewrites the
+	// register from its shadow on every cursor-blink tick (bit 4 is the
+	// blink phase), base 0x04 in Wang mode and 0x0c in IS mode, and the
+	// switch itself goes out 2e06=30 / out 2e0a=21 / out 2e1e=5c /
+	// out 2e0a=29. Each mode owns a text buffer: Wang writes the F
+	// segment, IS monochrome the buffer at 0xb0000, IS CGA the one at
+	// 0xb8000 - and 0x2e06 tells the last two apart (0x30 mono, 0x20
+	// CGA, written twice right after the CGA switch).
+	uint8_t m_mode_2e1e = 0x04;
+	uint8_t m_disp_2e06 = 0x30;
 	mutable uint32_t m_scr_sum[3] = { 0, 0, 0 };
 	mutable uint32_t m_scr_when[3] = { 0, 0, 0 };
 	mutable uint32_t m_scr_clock = 0;
@@ -1280,16 +1292,36 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 		}
 	}
 
-	uint32_t when = 0;
-	for (int k = 0; k < 3; k++)
+	// The mode register decides first: bit 3 of 0x2e1e picks Wang (the F
+	// segment) against Industry Standard, and 0x2e06 splits IS between
+	// the mono and the CGA buffer. Only when the register points at a
+	// buffer with nothing readable in it (early POST, or a BIOS that
+	// never touches the register, like the 4.02.03) does the
+	// written-last heuristic below keep the choice.
+	// (a bare prompt is a dozen cells, so the register's pick only needs
+	// the buffer to be non-empty - the >40 threshold stays with the
+	// heuristic, where it tells screens from data tables)
+	int pick = (m_mode_2e1e & 0x08) ? ((m_disp_2e06 == 0x20) ? 1 : 2) : 0;
+	if (pick == 0 && !m_fseg_ram)
+		pick = -1;
+	if (pick >= 0 && score(bufs[pick], shifts[pick]) > 0)
 	{
-		if (k == 0 && !m_fseg_ram)
-			continue;
-		if (score(bufs[k], shifts[k]) > 40 && m_scr_when[k] >= when)
+		tbuf = bufs[pick];
+		shift = shifts[pick];
+	}
+	else
+	{
+		uint32_t when = 0;
+		for (int k = 0; k < 3; k++)
 		{
-			when = m_scr_when[k];
-			tbuf = bufs[k];
-			shift = shifts[k];
+			if (k == 0 && !m_fseg_ram)
+				continue;
+			if (score(bufs[k], shifts[k]) > 40 && m_scr_when[k] >= when)
+			{
+				when = m_scr_when[k];
+				tbuf = bufs[k];
+				shift = shifts[k];
+			}
 		}
 	}
 
@@ -1643,7 +1675,8 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 					| m_kb_status;
 		}
 		return 0x00fe; // measured 0xfc idle; bit1 (ready to accept) forced high
-	case 0x2e1e: return 0x00f4; // mode/config register, measured on real hardware:
+	case 0x2e1e: return 0x00f4 | (m_mode_2e1e & 0x08);
+	                            // mode/config register, measured on real hardware:
 	                            // 0xf4 in Wang mode, 0xfc in Industry Standard mode
 	                            // (bit3 = IS mode); bit7=1 (display type, LCD) selects
 	                            // the 0xde/0xbb constant set at POST
@@ -1686,6 +1719,12 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	// happens to hang off the same first write.
 	if ((offset << 1) == 0x2d00 && ACCESSING_BITS_0_7)
 		m_video_window = data & 0xff;
+
+	// Mode and display-source registers - see the members' comment.
+	if ((offset << 1) == 0x2e1e && ACCESSING_BITS_0_7)
+		m_mode_2e1e = data & 0xff;
+	if ((offset << 1) == 0x2e06 && ACCESSING_BITS_0_7)
+		m_disp_2e06 = data & 0xff;
 
 	if ((offset << 1) == 0x2d00 && m_boot_mirror && !machine().side_effects_disabled())
 	{
