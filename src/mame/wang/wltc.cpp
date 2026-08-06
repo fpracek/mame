@@ -753,6 +753,27 @@ private:
 	void set_source(int n, bool state)
 	{
 		bool const was = BIT(m_source_state, n);
+		// When the 8259 carries the interrupts, the two counters need their
+		// request latched rather than followed: their outputs are levels that
+		// stay high, and the controller is programmed level triggered, so a
+		// followed line is acknowledged again every few microseconds for ever.
+		// The real machine latches the edge in the gate array and drops the
+		// request when the handler writes its end-of-interrupt port - 2c16 and
+		// 2c10 for counter 1, 2c14 and 2c10 for counter 2, which is what the
+		// POST's own handlers do. Measured: with this, the two runs stay
+		// together nine milliseconds longer and get past the point where they
+		// used to separate.
+		if (m_pic_ready)
+		{
+			if (n < 2)
+			{
+				if (state && !was) pic_ir(n, 1);
+			}
+			else if (state != was)
+				pic_ir(n, state);
+			if (state) m_source_state |= 1 << n; else m_source_state &= ~(1 << n);
+			return;
+		}
 		if (state)
 			m_source_state |= 1 << n;
 		else
@@ -1706,6 +1727,15 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	if (m_legacy_bios && ACCESSING_BITS_0_7
 			&& ((offset << 1) == 0x2200 || (offset << 1) == 0x2202))
 		m_pic->write(((offset << 1) == 0x2200) ? 0 : 1, data & 0xff);
+
+	// the gate array's end-of-interrupt ports for the two counters
+	if (m_legacy_bios && m_pic_ready && ACCESSING_BITS_0_7)
+	{
+		if ((offset << 1) == 0x2c16 || (offset << 1) == 0x2c10)
+			{ pic_ir(0, 0); m_source_state &= ~1; }
+		if ((offset << 1) == 0x2c14 || (offset << 1) == 0x2c10)
+			{ pic_ir(1, 0); m_source_state &= ~2; }
+	}
 
 	if ((offset << 1) == 0x2202)
 	{
