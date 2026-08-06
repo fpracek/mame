@@ -1453,6 +1453,36 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 				*dst++ = BIT(bits, cx & 7) ? fg : bg;
 			}
 		}
+		// The text cursor, Industry Standard modes. No hardware register
+		// in sight carries its position (measured: 0x2a04/0x2a06 are
+		// never written while it moves, no F-segment register changes,
+		// no attribute marking on the cell) - XLAT keeps it in the BIOS
+		// data area like a real PC BIOS, so that is where the panel has
+		// to read it from. The blink runs on machine time: bit 4 of the
+		// mode register carries the console's blink phase but its writer
+		// goes quiet at an idle DOS prompt (measured), so it cannot be
+		// the clock here.
+		if ((m_mode_2e1e & 0x08) && tbuf != static_cast<uint16_t const *>(m_fram.target())
+				&& (int(machine().time().as_double() / 0.4) & 1))
+		{
+			uint8_t const *const bda = reinterpret_cast<uint8_t const *>(m_lowram.target());
+			int const page = bda[0x462] & 7;
+			int const ccol = bda[0x450 + page * 2];
+			int const crow = bda[0x451 + page * 2];
+			if (crow < 25 && ccol < cols)
+			{
+				int const x0 = ccol << (largo ? 4 : 3);
+				int const larghezza = largo ? 16 : 8;
+				for (int y = crow * 8 + 6; y <= crow * 8 + 7; y++)
+				{
+					if (y < cliprect.top() || y > cliprect.bottom())
+						continue;
+					for (int x = x0; x < x0 + larghezza; x++)
+						if (x >= cliprect.left() && x <= cliprect.right())
+							bitmap.pix(y, x) = fg;
+				}
+			}
+		}
 		return 0;
 	}
 
