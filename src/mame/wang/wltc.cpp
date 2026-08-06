@@ -533,6 +533,7 @@ public:
 		driver_device(mconfig, type, tag),
 		m_maincpu(*this, "maincpu"),
 		m_pit(*this, "pit"),
+		m_pit_ibm(*this, "pit_ibm"),
 		m_pic(*this, "pic"),
 		m_uart(*this, "uart"),
 		m_scc(*this, "scc"),
@@ -565,6 +566,7 @@ protected:
 private:
 	required_device<v30_device> m_maincpu;
 	required_device<pit8254_device> m_pit;
+	required_device<pit8254_device> m_pit_ibm;
 	required_device<pic8259_device> m_pic;
 	required_device<ins8250_device> m_uart;
 	required_device<scc8530_device> m_scc;
@@ -599,6 +601,44 @@ private:
 	// switch is in progress and raised again at the end; bit 5 rides
 	// along on every value the loaded system writes.
 	uint8_t m_disp_2e0a = 0x29;
+	// IBM aliases of the gate array's Industry Standard side. PC
+	// software runs on this machine unchanged - the Digger port
+	// reprograms the interval timer at 0x40-0x43, sends EOI to 0x20,
+	// reads its keystrokes from 0x60 and drives the CGA registers
+	// directly - and the real hardware answers on those addresses (the
+	// port scan on the machine shows 0x20/0x21, 0x3B5, 0x3D5 alive).
+	// CGA side: 0x3d8 mode select (bit 1 = graphics, bit 4 = 640-wide),
+	// 0x3d9 colour select, 0x3d4/0x3d5 = 6845 index/data, all latched.
+	uint8_t m_cga_mode = 0;
+	uint8_t m_cga_color = 0;
+	uint8_t m_crtc_idx = 0;
+	uint8_t m_crtc_reg[32] = {};
+	// 0x60 = scancode latch, 0x61 = system control latch. On real
+	// hardware the keyboard micro's Industry Standard set delivers IBM
+	// scancodes; the translation table below is the one XLAT keeps at
+	// [EBC8:0655] (Wang keycode -> IBM scancode), read out of the
+	// running machine - the arrows land on 48/50/4B/4D and the left
+	// shift on 2A, exactly the codes the Digger port listens for.
+	uint8_t m_port60 = 0;
+	uint8_t m_port61 = 0;
+	static constexpr uint8_t WANG2IBM[0x80] = {
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0x51, 0x45, 0x46, 0x4a, 0x2b, 0x48, 0x49, 0x4d,
+		0x29, 0x37, 0x2d, 0x2a, 0x1c, 0x2b, 0x3a, 0x00,
+		0x01, 0x1b, 0x00, 0x00, 0x1d, 0x38, 0x47, 0xff,
+		0x50, 0x48, 0x34, 0x0e, 0x39, 0x4b, 0x4d, 0x0c,
+		0x50, 0x4f, 0x53, 0x29, 0x52, 0x36, 0xff, 0x35,
+		0x33, 0x32, 0x31, 0x30, 0x2f, 0x2e, 0x2d, 0x2c,
+		0x4c, 0x4b, 0x00, 0x00, 0x1c, 0x28, 0x27, 0x26,
+		0x25, 0x24, 0x23, 0x22, 0x21, 0x20, 0x1f, 0x1e,
+		0x47, 0x51, 0x53, 0x4f, 0x2a, 0x1a, 0x19, 0x18,
+		0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10,
+		0x4e, 0x49, 0x52, 0xff, 0x0d, 0x0b, 0x0a, 0x09,
+		0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x0f,
+		0xff, 0xff, 0x00, 0x3f, 0x3c, 0x44, 0x43, 0x42,
+		0x41, 0x40, 0x3f, 0x3e, 0x3d, 0x3c, 0x3b, 0xff,
+	};
 	mutable uint32_t m_scr_sum[3] = { 0, 0, 0 };
 	mutable uint32_t m_scr_when[3] = { 0, 0, 0 };
 	mutable uint32_t m_scr_clock = 0;
@@ -927,7 +967,7 @@ private:
 		// That gives the PC backslash key a real backslash (and pipe on
 		// shift) while the backtick key keeps its backtick.
 		{ 0x53, 0x1b, 0x35, 0x24, 0x25, 0x12, 0x2c, 0x2b,
-		  0x1a, 0x1e, 0x33, 0x54, 0, 0, 0, 0 },
+		  0x1a, 0x1e, 0x33, 0x54, 0x29, 0x28, 0x2d, 0x2e },
 	};
 	required_ioport_array<5> m_keys;
 	uint16_t m_kb_seen[5] = { 0, 0, 0, 0, 0 };
@@ -995,6 +1035,13 @@ private:
 			m_kb_rx = m_kb_replies.front();
 			m_kb_replies.pop_front();
 			m_kb_status |= 0x02;
+			// the gate array's IBM side latches the scancode at 0x60
+			// (Industry Standard set: Wang keycode -> IBM scancode,
+			// break keeps bit 7); command replies fall outside the
+			// table and leave the latch alone
+			uint8_t const scan = WANG2IBM[m_kb_rx & 0x7f];
+			if (scan != 0x00 && scan != 0xff)
+				m_port60 = scan | (m_kb_rx & 0x80);
 		}
 		else if (!(m_kb_status & 0x03) && m_kb_ready_again)
 		{
@@ -1305,18 +1352,30 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 	// CIRCLE/PAINT drawing out of the dumped buffer). The panel shows
 	// CGA colour as tones, so the four pixel values become four shades,
 	// and the 320 pixels are doubled across the 640-dot line.
-	if ((m_mode_2e1e & 0x08) && (m_disp_2e0a & 0x07) == 0x02)
+	// Graphics also turns on when PC software drives the CGA mode
+	// register directly (3d8 bit 1) while the IS source is the CGA
+	// side - that is how the Digger port switches, without ever going
+	// through INT 10h (XLAT's INT 10h has no graphics modes at all:
+	// the only two mode writes into the BIOS data area are 3 and 7).
+	bool const cga_gfx = (m_mode_2e1e & 0x08) && m_disp_2e06 == 0x20 && BIT(m_cga_mode, 1);
+	if (((m_mode_2e1e & 0x08) && (m_disp_2e0a & 0x07) == 0x02) || cga_gfx)
 	{
 		rgb_t const tone[4] = { bg, rgb_t(0x94, 0xa4, 0x3c), rgb_t(0x60, 0x70, 0x2c), fg };
 		uint8_t const *const gfx = reinterpret_cast<uint8_t const *>(m_textram.target());
+		bool const hires = cga_gfx && BIT(m_cga_mode, 4);
 		for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
 		{
 			uint8_t const *const src = gfx + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
 			uint32_t *dst = &bitmap.pix(y, cliprect.left());
 			for (int x = cliprect.left(); x <= cliprect.right(); x++)
 			{
-				int const gx = x >> 1;
-				*dst++ = tone[(src[gx >> 2] >> (6 - 2 * (gx & 3))) & 3];
+				if (hires)
+					*dst++ = BIT(src[x >> 3], 7 - (x & 7)) ? fg : bg;
+				else
+				{
+					int const gx = x >> 1;
+					*dst++ = tone[(src[gx >> 2] >> (6 - 2 * (gx & 3))) & 3];
+				}
 			}
 		}
 		return 0;
@@ -1458,6 +1517,31 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	// counter 0, failing "too early" into error 57
 	if ((offset << 1) >= 0x2400 && (offset << 1) <= 0x2407)
 		return m_pit->read(offset & 3);
+
+	// IBM-side timer at 0x40-0x43, one register per byte address: the
+	// Digger port latches and reads counter 0 in its sync loop - with
+	// nothing here it read 0xFF forever and never reached its video
+	// setup. NOT the Wang timer: wiring these ports to the system
+	// D71054 lets the game reprogram the counter the whole machine's
+	// tick hangs off (measured: the BDA tick raced to ~3000/s and the
+	// game starved before its calibration loop), so the alias gets a
+	// timer of its own at the PC's 1.19 MHz.
+	if ((offset << 1) == 0x40 || (offset << 1) == 0x42)
+	{
+		int const base = ((offset << 1) == 0x40) ? 0 : 2;
+		uint16_t r = 0;
+		if (ACCESSING_BITS_0_7)
+			r |= m_pit_ibm->read(base);
+		if (ACCESSING_BITS_8_15)
+			r |= m_pit_ibm->read(base + 1) << 8;
+		return r;
+	}
+	if ((offset << 1) == 0x60)
+		return m_port60 | (m_port61 << 8);
+	if ((offset << 1) == 0x3d4)
+		return m_crtc_idx | (m_crtc_reg[m_crtc_idx] << 8);
+	if ((offset << 1) == 0x3d8)
+		return m_cga_mode | (m_cga_color << 8);
 
 	// NCR 53C80 SCSI controller at 0x2700-0x270e, one register every
 	// other address in the standard order (output data, initiator
@@ -1755,6 +1839,40 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	// happens to hang off the same first write.
 	if ((offset << 1) == 0x2d00 && ACCESSING_BITS_0_7)
 		m_video_window = data & 0xff;
+
+	// IBM aliases (see the members' comment): timer, system latch, CGA.
+	if ((offset << 1) == 0x40 || (offset << 1) == 0x42)
+	{
+		int const base = ((offset << 1) == 0x40) ? 0 : 2;
+		if (ACCESSING_BITS_0_7)
+			m_pit_ibm->write(base, data & 0xff);
+		if (ACCESSING_BITS_8_15)
+			m_pit_ibm->write(base + 1, (data >> 8) & 0xff);
+		return;
+	}
+	if ((offset << 1) == 0x60)
+	{
+		// 0x60 itself is the read-only scancode latch; 0x61 sticks
+		if (ACCESSING_BITS_8_15)
+			m_port61 = (data >> 8) & 0xff;
+		return;
+	}
+	if ((offset << 1) == 0x3d4)
+	{
+		if (ACCESSING_BITS_0_7)
+			m_crtc_idx = data & 0x1f;
+		if (ACCESSING_BITS_8_15)
+			m_crtc_reg[m_crtc_idx] = (data >> 8) & 0xff;
+		return;
+	}
+	if ((offset << 1) == 0x3d8)
+	{
+		if (ACCESSING_BITS_0_7)
+			m_cga_mode = data & 0xff;
+		if (ACCESSING_BITS_8_15)
+			m_cga_color = (data >> 8) & 0xff;
+		return;
+	}
 
 	// Mode and display-source registers - see the members' comment.
 	if ((offset << 1) == 0x2e1e && ACCESSING_BITS_0_7)
@@ -2565,12 +2683,20 @@ static INPUT_PORTS_START( wltc )
 	PORT_BIT(0x0008, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Ctrl") PORT_CODE(KEYCODE_LCONTROL)
 	PORT_BIT(0x0010, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Alt") PORT_CODE(KEYCODE_LALT)
 	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("CANCEL") PORT_CODE(KEYCODE_DEL)
-	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Space (Item Select)") PORT_CODE(KEYCODE_SPACE) PORT_CODE(KEYCODE_DOWN)
-	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Backspace (Item Up)") PORT_CODE(KEYCODE_BACKSPACE) PORT_CODE(KEYCODE_UP)
+	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Space (Item Select)") PORT_CODE(KEYCODE_SPACE)
+	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Backspace (Item Up)") PORT_CODE(KEYCODE_BACKSPACE)
 	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("ESC (Wang)") PORT_CODE(KEYCODE_END)
 	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Caps Lock") PORT_CODE(KEYCODE_CAPSLOCK) PORT_CODE(KEYCODE_RCONTROL)
 	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("` (backtick)") PORT_CODE(KEYCODE_TILDE)
 	PORT_BIT(0x0800, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("\\") PORT_CODE(KEYCODE_BACKSLASH)
+	// the Wang keyboard's own arrow keys (bottom right on the real
+	// unit): codes read off XLAT's scancode table, where they map to
+	// the IBM arrows 48/50/4B/4D - which is what the Digger port
+	// steers with. Space/Backspace stay the Wang menu keys.
+	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Freccia su") PORT_CODE(KEYCODE_UP)
+	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Freccia giu'") PORT_CODE(KEYCODE_DOWN)
+	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Freccia sinistra") PORT_CODE(KEYCODE_LEFT)
+	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Freccia destra") PORT_CODE(KEYCODE_RIGHT)
 
 	// experiment switch: what an undecoded port read returns. The 1986
 	// BIOS picks its boot mode from configuration bits (bit 13 of the
@@ -2633,6 +2759,15 @@ void wltc_state::wltc(machine_config &config)
 	m_pit->set_clk<0>(2'764'800);
 	m_pit->set_clk<1>(2'764'800 / 4);
 	m_pit->set_clk<2>(2'764'800 / 4);   // tested identically to counter 1
+
+	// The IBM alias at 0x40-0x43 (Industry Standard side of the gate
+	// array): a timer of its own at the PC's clock, free-running for
+	// the software that latches and reads it (Digger's sync loop);
+	// counter 2 is the speaker tone. Outputs unwired for now.
+	PIT8254(config, m_pit_ibm);
+	m_pit_ibm->set_clk<0>(1'193'182);
+	m_pit_ibm->set_clk<1>(1'193'182);
+	m_pit_ibm->set_clk<2>(1'193'182);
 	// counter 0 is the system tick on IRQ0, as the measured interrupt
 	// mask (0xbc) and vector table (INT 80h = the tick ISR) imply
 	m_pit->out_handler<0>().set(FUNC(wltc_state::pit_out_w<0>));
