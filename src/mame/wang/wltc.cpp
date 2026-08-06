@@ -1453,34 +1453,58 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 				*dst++ = BIT(bits, cx & 7) ? fg : bg;
 			}
 		}
-		// The text cursor, Industry Standard modes. No hardware register
-		// in sight carries its position (measured: 0x2a04/0x2a06 are
-		// never written while it moves, no F-segment register changes,
-		// no attribute marking on the cell) - XLAT keeps it in the BIOS
-		// data area like a real PC BIOS, so that is where the panel has
-		// to read it from. The blink runs on machine time: bit 4 of the
-		// mode register carries the console's blink phase but its writer
-		// goes quiet at an idle DOS prompt (measured), so it cannot be
-		// the clock here.
-		if ((m_mode_2e1e & 0x08) && tbuf != static_cast<uint16_t const *>(m_fram.target())
-				&& (int(machine().time().as_double() / 0.4) & 1))
+		// The text cursor. No hardware register in sight carries its
+		// position (measured: 0x2a04/0x2a06 are never written while it
+		// moves, no F-segment register changes, no attribute marking on
+		// the cell), so the panel reads it where each side keeps it:
+		//
+		// - Industry Standard modes: the BIOS data area, like a real PC
+		//   BIOS - page at 0040:0462, column and row at 0040:0450.
+		// - Wang mode: the console's current-channel pointer at
+		//   [E358:1280] leads to the display channel descriptor, which
+		//   carries the video segment at +2 (0xF000, the guard), cursor
+		//   row at +5, column at +6, and the visibility flag at +0x12
+		//   bit 0 (0x0B with the cursor shown at the access screen and
+		//   the DOS prompt, 0x0A at the menu - all measured by state
+		//   diffing). Guards make a moved layout fail silent.
+		//
+		// The blink runs on machine time: bit 4 of the mode register
+		// carries the console's blink phase but its writer goes quiet
+		// at an idle DOS prompt (measured), so it cannot be the clock.
+		int crow = -1, ccol = -1;
+		if ((m_mode_2e1e & 0x08) && tbuf != static_cast<uint16_t const *>(m_fram.target()))
 		{
 			uint8_t const *const bda = reinterpret_cast<uint8_t const *>(m_lowram.target());
 			int const page = bda[0x462] & 7;
-			int const ccol = bda[0x450 + page * 2];
-			int const crow = bda[0x451 + page * 2];
-			if (crow < 25 && ccol < cols)
+			ccol = bda[0x450 + page * 2];
+			crow = bda[0x451 + page * 2];
+		}
+		else if (tbuf == static_cast<uint16_t const *>(m_fram.target()))
+		{
+			uint8_t const *const sh = reinterpret_cast<uint8_t const *>(m_shadow.target());
+			uint16_t const chan = sh[0x4800] | (sh[0x4801] << 8);
+			if (chan >= 0x1000 && chan < 0xc000)
 			{
-				int const x0 = ccol << (largo ? 4 : 3);
-				int const larghezza = largo ? 16 : 8;
-				for (int y = crow * 8 + 6; y <= crow * 8 + 7; y++)
+				uint32_t const cs = 0x3580 + chan;
+				if ((sh[cs + 2] | (sh[cs + 3] << 8)) == 0xf000 && (sh[cs + 0x12] & 1))
 				{
-					if (y < cliprect.top() || y > cliprect.bottom())
-						continue;
-					for (int x = x0; x < x0 + larghezza; x++)
-						if (x >= cliprect.left() && x <= cliprect.right())
-							bitmap.pix(y, x) = fg;
+					crow = sh[cs + 5];
+					ccol = sh[cs + 6];
 				}
+			}
+		}
+		if (crow >= 0 && crow < 25 && ccol >= 0 && ccol < cols
+				&& (int(machine().time().as_double() / 0.4) & 1))
+		{
+			int const x0 = ccol << (largo ? 4 : 3);
+			int const larghezza = largo ? 16 : 8;
+			for (int y = crow * 8 + 6; y <= crow * 8 + 7; y++)
+			{
+				if (y < cliprect.top() || y > cliprect.bottom())
+					continue;
+				for (int x = x0; x < x0 + larghezza; x++)
+					if (x >= cliprect.left() && x <= cliprect.right())
+						bitmap.pix(y, x) = fg;
 			}
 		}
 		return 0;
