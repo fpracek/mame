@@ -593,6 +593,12 @@ private:
 	// CGA, written twice right after the CGA switch).
 	uint8_t m_mode_2e1e = 0x04;
 	uint8_t m_disp_2e06 = 0x30;
+	// 0x2e0a carries the video mode number in its low bits (measured
+	// with GW-BASIC against the port log): 1 = 80-column text, 2 =
+	// 320x200 graphics, 4 = 40-column text. Bit 3 is dropped while a
+	// switch is in progress and raised again at the end; bit 5 rides
+	// along on every value the loaded system writes.
+	uint8_t m_disp_2e0a = 0x29;
 	mutable uint32_t m_scr_sum[3] = { 0, 0, 0 };
 	mutable uint32_t m_scr_when[3] = { 0, 0, 0 };
 	mutable uint32_t m_scr_clock = 0;
@@ -1292,6 +1298,30 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 		}
 	}
 
+	// Industry Standard graphics: SCREEN 1 in GW-BASIC writes mode 2
+	// into 0x2e0a, and the bitmap is the standard CGA layout in the
+	// buffer at 0xb8000 - even scanlines at +0000, odd at +0x2000, 80
+	// bytes a row, two bits a pixel MSB first (verified by decoding a
+	// CIRCLE/PAINT drawing out of the dumped buffer). The panel shows
+	// CGA colour as tones, so the four pixel values become four shades,
+	// and the 320 pixels are doubled across the 640-dot line.
+	if ((m_mode_2e1e & 0x08) && (m_disp_2e0a & 0x07) == 0x02)
+	{
+		rgb_t const tone[4] = { bg, rgb_t(0x94, 0xa4, 0x3c), rgb_t(0x60, 0x70, 0x2c), fg };
+		uint8_t const *const gfx = reinterpret_cast<uint8_t const *>(m_textram.target());
+		for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
+		{
+			uint8_t const *const src = gfx + ((y & 1) ? 0x2000 : 0) + (y >> 1) * 80;
+			uint32_t *dst = &bitmap.pix(y, cliprect.left());
+			for (int x = cliprect.left(); x <= cliprect.right(); x++)
+			{
+				int const gx = x >> 1;
+				*dst++ = tone[(src[gx >> 2] >> (6 - 2 * (gx & 3))) & 3];
+			}
+		}
+		return 0;
+	}
+
 	// The mode register decides first: bit 3 of 0x2e1e picks Wang (the F
 	// segment) against Industry Standard, and 0x2e06 splits IS between
 	// the mono and the CGA buffer. Only when the register points at a
@@ -1330,13 +1360,19 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 		// 25 rows of 8 scanlines over the 200-line panel, one glyph row
 		// per scanline, taken from the character generator's doubled
 		// cells (every other byte of a 32-byte glyph is the 8x8 font).
+		// In IS 40-column text (SCREEN 0 in BASIC, mode 4 in 0x2e0a)
+		// the row is 40 cells and every glyph pixel is doubled.
+		bool const largo = (m_mode_2e1e & 0x08) && (m_disp_2e0a & 0x07) == 0x04
+				&& tbuf == static_cast<uint16_t const *>(m_textram.target());
+		int const cols = largo ? 40 : 80;
 		for (int y = cliprect.top(); y <= cliprect.bottom(); y++)
 		{
 			int const row = y >> 3, line = y & 7;
 			uint32_t *dst = &bitmap.pix(y, cliprect.left());
 			for (int x = cliprect.left(); x <= cliprect.right(); x++)
 			{
-				uint8_t const ch = (tbuf[(row * 80) + (x >> 3)] >> shift) & 0xff;
+				int const cx = largo ? (x >> 1) : x;
+				uint8_t const ch = (tbuf[(row * cols) + (cx >> 3)] >> shift) & 0xff;
 				// The Wang-mode display renders the high codes with the
 				// display micro's own font, which has never been dumped.
 				// The EPROM font we substitute is CP437-flavoured up
@@ -1355,7 +1391,7 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 				// bit 0 is the leftmost pixel, not bit 7: 'L' reads
 				// 0x06 on its upright rows and 'J' 0x78 on its top
 				// row - the other way round every glyph is mirrored
-				*dst++ = BIT(bits, x & 7) ? fg : bg;
+				*dst++ = BIT(bits, cx & 7) ? fg : bg;
 			}
 		}
 		return 0;
@@ -1725,6 +1761,8 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		m_mode_2e1e = data & 0xff;
 	if ((offset << 1) == 0x2e06 && ACCESSING_BITS_0_7)
 		m_disp_2e06 = data & 0xff;
+	if ((offset << 1) == 0x2e0a && ACCESSING_BITS_0_7)
+		m_disp_2e0a = data & 0xff;
 
 	if ((offset << 1) == 0x2d00 && m_boot_mirror && !machine().side_effects_disabled())
 	{
