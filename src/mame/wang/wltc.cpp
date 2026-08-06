@@ -581,6 +581,9 @@ private:
 	// Video window select and F-segment mapping - see screen_update and
 	// the 0x2d00 / 0x2d02 writes in io_w.
 	uint8_t m_video_window = 0;
+	mutable uint32_t m_scr_sum[3] = { 0, 0, 0 };
+	mutable uint32_t m_scr_when[3] = { 0, 0, 0 };
+	mutable uint32_t m_scr_clock = 0;
 	bool m_fseg_ram = false;
 	std::vector<uint8_t> m_fseg_logged;
 	uint8_t m_ivt_seed_rom[0x240];
@@ -1251,25 +1254,43 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 
 	uint16_t const *tbuf = nullptr;
 	int shift = 0;
-	int best = 40;   // below this it is noise, not a screen
-	// The Wang display's cells are the other way round from the two PC
-	// buffers - attribute first, character second - so its glyph is the
-	// high byte. The window register at 0x2d00 does not choose between
-	// them: the display driver writes it before every character and puts
-	// the channel's value back, and the diagnostic runs with it on 0x06
-	// while drawing into the same F segment the menu uses at 0x0c.
-	if (m_fseg_ram)
+	// Scoring alone picks the buffer with the most valid cells, and that is
+	// wrong as soon as two of them hold something: the loader's banner is
+	// five full lines that stay in the mono buffer for ever, while a DOS
+	// prompt is a dozen characters. The machine's owner sat watching the
+	// banner while the emulated machine was already at its prompt.
+	//
+	// So the score only says what is not noise; which buffer is live is
+	// decided by which one was written to last, and a cheap checksum per
+	// frame says that. The choice is sticky, so a screen that stops
+	// changing stays on screen.
+	uint16_t const *const bufs[3] = { m_fram, m_textram, m_monoram };
+	int const shifts[3] = { 8, 0, 0 };
+	for (int k = 0; k < 3; k++)
 	{
-		int const n = score(m_fram, 8);
-		if (n > best) { best = n; tbuf = m_fram; shift = 8; }
+		if (k == 0 && !m_fseg_ram)
+			continue;
+		uint32_t h = 0;
+		for (int i = 0; i < 80 * 25; i++)
+			h = (h * 31) + bufs[k][i];
+		if (h != m_scr_sum[k])
+		{
+			m_scr_sum[k] = h;
+			m_scr_when[k] = ++m_scr_clock;
+		}
 	}
+
+	uint32_t when = 0;
+	for (int k = 0; k < 3; k++)
 	{
-		int const n = score(m_textram, 0);
-		if (n > best) { best = n; tbuf = m_textram; shift = 0; }
-	}
-	{
-		int const n = score(m_monoram, 0);
-		if (n > best) { best = n; tbuf = m_monoram; shift = 0; }
+		if (k == 0 && !m_fseg_ram)
+			continue;
+		if (score(bufs[k], shifts[k]) > 40 && m_scr_when[k] >= when)
+		{
+			when = m_scr_when[k];
+			tbuf = bufs[k];
+			shift = shifts[k];
+		}
 	}
 
 	if (tbuf)
