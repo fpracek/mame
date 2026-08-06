@@ -966,6 +966,21 @@ private:
 	template <int N>
 	void pit_out_w(int state)
 	{
+		// Counter 0 used to be wired straight to the controller's ir0 in the
+		// machine configuration, which meant it drove that line under the
+		// 1986 BIOS as well - where the controller is level triggered, and a
+		// counter output that is high half the time floods it. Every attempt
+		// at moving the sources onto the controller failed on that wire,
+		// not on the code they changed: the log showed ir0 acknowledged
+		// while this driver's own shadow said no line was up.
+		if (!m_legacy_bios)
+		{
+			if (N == 0)
+				m_pic->ir0_w(state);
+			return;
+		}
+		if (N == 0)
+			return;   // the 1986 tick comes through its own path
 		// the counter output is a level: the request follows it
 		set_source(N - 1, state != 0);
 	}
@@ -2449,7 +2464,7 @@ void wltc_state::wltc(machine_config &config)
 	m_pit->set_clk<2>(2'764'800 / 4);   // tested identically to counter 1
 	// counter 0 is the system tick on IRQ0, as the measured interrupt
 	// mask (0xbc) and vector table (INT 80h = the tick ISR) imply
-	m_pit->out_handler<0>().set(m_pic, FUNC(pic8259_device::ir0_w));
+	m_pit->out_handler<0>().set(FUNC(wltc_state::pit_out_w<0>));
 	// counters 1 and 2 interrupt through the gate array on the 1986
 	// hardware (vectors 0x20/0x21, enabled by bits 0/1 of port 0x2202);
 	// deliver their OUT edges straight to the CPU INT line there - the
