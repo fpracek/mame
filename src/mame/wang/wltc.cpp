@@ -1,4 +1,4 @@
-// license:BSD-3-Clause
+﻿// license:BSD-3-Clause
 // copyright-holders:Fausto Pracek
 /*
 
@@ -923,7 +923,20 @@ private:
 	// 0x5f-3), so the rest of each row is filled in from the pattern.
 	// Being positional it holds for QWERTZ as well: the label changes,
 	// the code does not.
-	static inline constexpr uint8_t KB_CODE[5][16] = {
+	// The function row is TWELVE keys: the direct table gives them the
+	// contiguous internal numbers 0x44-0x4f (keycodes 0x73-0x7e), and
+	// the machine reaches F13-F24 with Shift and F25-F36 with
+	// Shift+Ctrl - which is why a PC keyboard maps naturally. The four
+	// codes 0x6f-0x72 that used to be wired as "F13-F16" are OTHER
+	// keys: XLAT maps 0x6f to the IBM Tab, and 0x70-0x72 carry the
+	// special-function numbers 0x51/0x50/0x62 (HELP/ERASE/GL family,
+	// attribution pending real-hardware checks).
+	//
+	// Keypad, attributed by measurement (7/8/2026): the number-to-
+	// character map was read out by repointing a key over the numbers
+	// 0x2b-0x3c and echoing - 0x2d..0x36 are keypad 0-9, 0x37-0x3a are
+	// + - * /; inverting the direct table then names every keycode.
+	static inline constexpr uint8_t KB_CODE[7][16] = {
 		// digits, left to right. The '-' comes from the keypad key,
 		// which carries the same character; the machine's own key at the
 		// PC minus position is '=' (0x64, echo-verified).
@@ -937,9 +950,12 @@ private:
 		// a row, with RETURN at its right-hand end
 		{ 0x4f, 0x4e, 0x4d, 0x4c, 0x4b, 0x4a, 0x49, 0x48,
 		  0x47, 0x46, 0x45, 0x44, 0x76, 0x75, 0x74, 0x73 },
-		// z row. Echo-verified: 0x38 ',', 0x2a '.', 0x37 '/'.
+		// z row. Echo-verified: 0x38 ',', 0x2a '.', 0x37 '/'. The high
+		// bits carry TAB (0x6f, from XLAT's scancode table) and the
+		// three unattributed special keys 0x70-0x72, provisionally
+		// labelled HELP?/ERASE?/GL? until the real machine names them.
 		{ 0x3f, 0x3e, 0x3d, 0x3c, 0x3b, 0x3a, 0x39, 0x38,
-		  0x2a, 0x37, 0, 0, 0x72, 0x71, 0x70, 0x6f },
+		  0x2a, 0x37, 0, 0, 0x6f, 0x70, 0x71, 0x72 },
 		// EXECUTE, the modifiers, and the navigation keys. CANCEL, the
 		// space bar and the up-mover were found by injection and then
 		// isolated one code at a time: from a submenu 0x12 on its own
@@ -969,9 +985,20 @@ private:
 		// shift) while the backtick key keeps its backtick.
 		{ 0x53, 0x1b, 0x35, 0x24, 0x25, 0x12, 0x2c, 0x2b,
 		  0x1a, 0x1e, 0x33, 0x54, 0x29, 0x28, 0x2d, 0x2e },
+		// keypad, fully attributed by measurement: 0-9, + - * /, Enter
+		{ 0x34, 0x31, 0x30, 0x10, 0x41, 0x40, 0x17, 0x50,
+		  0x15, 0x16, 0x60, 0x13, 0x14, 0x18, 0x1c, 0 },
+		// navigation and editing: the home arrow sits next to the
+		// cursor cluster (its number 0x5a adjoins the arrows' 0x56-59);
+		// PRINT/INSERT/PREV/DELETE come from XLAT's own scancode table
+		// (PrtSc/PgUp/PgDn/Del - INSERT and PREV carry exactly the
+		// "Pg Up"/"Pg Dn" their caps show); NEXT's number 0x5c adjoins
+		// DELETE's 0x5d.
+		{ 0x26, 0x19, 0x61, 0x51, 0x62, 0x52, 0, 0,
+		  0, 0, 0, 0, 0, 0, 0, 0 },
 	};
-	required_ioport_array<5> m_keys;
-	uint16_t m_kb_seen[5] = { 0, 0, 0, 0, 0 };
+	required_ioport_array<7> m_keys;
+	uint16_t m_kb_seen[7] = { 0, 0, 0, 0, 0, 0, 0 };
 	int m_kb_divider = 0;
 	// Press sends the code, release the same code with bit 7 set, and the
 	// firmware only takes a release that matches the key it has down -
@@ -979,7 +1006,7 @@ private:
 	// take: the poll below raises the console interrupt for them.
 	void scan_keyboard()
 	{
-		for (int row = 0; row < 5; row++)
+		for (int row = 0; row < 7; row++)
 		{
 			uint16_t const now = m_keys[row]->read();
 			uint16_t const diff = now ^ m_kb_seen[row];
@@ -2924,10 +2951,10 @@ static INPUT_PORTS_START( wltc )
 	// down at a time. Codes come from the positional model - the F
 	// row is 0x7f, descending to the right - and are the last part of
 	// the keyboard not yet confirmed against the real machine.
-	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F1") PORT_CODE(KEYCODE_F1) PORT_CONDITION("KB4", 0x0006, EQUALS, 0x0000)
-	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F2") PORT_CODE(KEYCODE_F2) PORT_CONDITION("KB4", 0x0006, EQUALS, 0x0000)
-	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F3") PORT_CODE(KEYCODE_F3) PORT_CONDITION("KB4", 0x0006, EQUALS, 0x0000)
-	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F4") PORT_CODE(KEYCODE_F4) PORT_CONDITION("KB4", 0x0006, EQUALS, 0x0000)
+	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F1") PORT_CODE(KEYCODE_F1)
+	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F2") PORT_CODE(KEYCODE_F2)
+	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F3") PORT_CODE(KEYCODE_F3)
+	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F4") PORT_CODE(KEYCODE_F4)
 
 	PORT_START("KB1")
 	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Q") PORT_CODE(KEYCODE_Q)
@@ -2942,10 +2969,10 @@ static INPUT_PORTS_START( wltc )
 	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("P") PORT_CODE(KEYCODE_P)
 	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("[") PORT_CODE(KEYCODE_OPENBRACE)
 	PORT_BIT(0x0800, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("]") PORT_CODE(KEYCODE_CLOSEBRACE)
-	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F5") PORT_CODE(KEYCODE_F5) PORT_CONDITION("KB4", 0x0006, EQUALS, 0x0000)
-	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F6") PORT_CODE(KEYCODE_F6) PORT_CONDITION("KB4", 0x0006, EQUALS, 0x0000)
-	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F7") PORT_CODE(KEYCODE_F7) PORT_CONDITION("KB4", 0x0006, EQUALS, 0x0000)
-	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F8") PORT_CODE(KEYCODE_F8) PORT_CONDITION("KB4", 0x0006, EQUALS, 0x0000)
+	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F5") PORT_CODE(KEYCODE_F5)
+	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F6") PORT_CODE(KEYCODE_F6)
+	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F7") PORT_CODE(KEYCODE_F7)
+	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F8") PORT_CODE(KEYCODE_F8)
 
 	PORT_START("KB2")
 	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("A") PORT_CODE(KEYCODE_A)
@@ -2960,10 +2987,10 @@ static INPUT_PORTS_START( wltc )
 	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME(";") PORT_CODE(KEYCODE_COLON)
 	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("'") PORT_CODE(KEYCODE_QUOTE)
 	PORT_BIT(0x0800, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("RETURN") PORT_CODE(KEYCODE_ENTER)
-	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F9") PORT_CODE(KEYCODE_F9) PORT_CONDITION("KB4", 0x0006, EQUALS, 0x0000)
-	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F10") PORT_CODE(KEYCODE_F10) PORT_CONDITION("KB4", 0x0006, EQUALS, 0x0000)
-	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F11") PORT_CODE(KEYCODE_F11) PORT_CONDITION("KB4", 0x0006, EQUALS, 0x0000)
-	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F12") PORT_CODE(KEYCODE_F12) PORT_CONDITION("KB4", 0x0006, EQUALS, 0x0000)
+	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F9") PORT_CODE(KEYCODE_F9)
+	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F10") PORT_CODE(KEYCODE_F10)
+	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F11") PORT_CODE(KEYCODE_F11)
+	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F12") PORT_CODE(KEYCODE_F12)
 
 	PORT_START("KB3")
 	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Z") PORT_CODE(KEYCODE_Z)
@@ -2976,13 +3003,18 @@ static INPUT_PORTS_START( wltc )
 	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME(",") PORT_CODE(KEYCODE_COMMA)
 	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME(".") PORT_CODE(KEYCODE_STOP)
 	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("/") PORT_CODE(KEYCODE_SLASH)
-	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F13 (shift F1)") PORT_CODE(KEYCODE_F1) PORT_CONDITION("KB4", 0x0006, NOTEQUALS, 0x0000)
-	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F14 (shift F2)") PORT_CODE(KEYCODE_F2) PORT_CONDITION("KB4", 0x0006, NOTEQUALS, 0x0000)
-	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F15 (shift F3)") PORT_CODE(KEYCODE_F3) PORT_CONDITION("KB4", 0x0006, NOTEQUALS, 0x0000)
-	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("F16 (shift F4)") PORT_CODE(KEYCODE_F4) PORT_CONDITION("KB4", 0x0006, NOTEQUALS, 0x0000)
+	// the F row is TWELVE keys: F13-F24 = Shift+F1..F12 and F25-F36 =
+	// Shift+Ctrl+F1..F12, exactly as on the machine (the modifiers
+	// travel as their own make/break codes and the firmware combines
+	// them). The four codes that used to sit here as "F13-F16" belong
+	// to other keys: TAB and three specials still to be named.
+	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("TAB") PORT_CODE(KEYCODE_TAB)
+	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("HELP? (codice 70, da verificare)") PORT_CODE(KEYCODE_F14)
+	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("ERASE? (codice 71, da verificare)") PORT_CODE(KEYCODE_F15)
+	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("GL? (codice 72, da verificare)") PORT_CODE(KEYCODE_F16)
 
 	PORT_START("KB4")
-	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("EXECUTE") PORT_CODE(KEYCODE_RALT) PORT_CODE(KEYCODE_ENTER_PAD)
+	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("EXECUTE") PORT_CODE(KEYCODE_RALT)
 	PORT_BIT(0x0002, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Left Shift") PORT_CODE(KEYCODE_LSHIFT)
 	PORT_BIT(0x0004, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Right Shift") PORT_CODE(KEYCODE_RSHIFT)
 	PORT_BIT(0x0008, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Ctrl") PORT_CODE(KEYCODE_LCONTROL)
@@ -3002,6 +3034,34 @@ static INPUT_PORTS_START( wltc )
 	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Freccia giu'") PORT_CODE(KEYCODE_DOWN)
 	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Freccia sinistra") PORT_CODE(KEYCODE_LEFT)
 	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Freccia destra") PORT_CODE(KEYCODE_RIGHT)
+
+	// the numeric keypad, fully attributed by measurement (the
+	// number-to-character map echoed out of the machine itself)
+	PORT_START("KB5")
+	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino 0") PORT_CODE(KEYCODE_0_PAD)
+	PORT_BIT(0x0002, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino 1") PORT_CODE(KEYCODE_1_PAD)
+	PORT_BIT(0x0004, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino 2") PORT_CODE(KEYCODE_2_PAD)
+	PORT_BIT(0x0008, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino 3") PORT_CODE(KEYCODE_3_PAD)
+	PORT_BIT(0x0010, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino 4") PORT_CODE(KEYCODE_4_PAD)
+	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino 5") PORT_CODE(KEYCODE_5_PAD)
+	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino 6") PORT_CODE(KEYCODE_6_PAD)
+	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino 7") PORT_CODE(KEYCODE_7_PAD)
+	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino 8") PORT_CODE(KEYCODE_8_PAD)
+	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino 9") PORT_CODE(KEYCODE_9_PAD)
+	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino +") PORT_CODE(KEYCODE_PLUS_PAD)
+	PORT_BIT(0x0800, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino -") PORT_CODE(KEYCODE_MINUS_PAD)
+	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino *") PORT_CODE(KEYCODE_ASTERISK)
+	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino /") PORT_CODE(KEYCODE_SLASH_PAD)
+	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Tastierino Invio") PORT_CODE(KEYCODE_ENTER_PAD)
+
+	// navigation and editing keys
+	PORT_START("KB6")
+	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("Home (freccia obliqua)") PORT_CODE(KEYCODE_HOME)
+	PORT_BIT(0x0002, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("PRINT") PORT_CODE(KEYCODE_PRTSCR)
+	PORT_BIT(0x0004, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("INSERT (Pg Up)") PORT_CODE(KEYCODE_INSERT)
+	PORT_BIT(0x0008, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("PREV (Pg Dn)") PORT_CODE(KEYCODE_PGDN)
+	PORT_BIT(0x0010, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("NEXT") PORT_CODE(KEYCODE_PGUP)
+	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("DE LETE") PORT_CODE(KEYCODE_F13)
 
 	// experiment switch: what an undecoded port read returns. The 1986
 	// BIOS picks its boot mode from configuration bits (bit 13 of the
