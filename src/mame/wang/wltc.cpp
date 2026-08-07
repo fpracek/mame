@@ -1257,9 +1257,18 @@ private:
 		// fired last
 		if (m_legacy_bios)
 			return m_gate_vector;
+		// Before ICW1 the 8259 cannot deliver anything (measured: asking
+		// MAME's device anyway returned 0xcd, whose IVT slot is still
+		// zeroed RAM - the CPU fell to 0000:0000 and marched through the
+		// vector table). Until the controller is programmed the gate
+		// array's own scheme is in charge, and the seeded IVT puts the
+		// tick on vector 0x80.
+		if (!m_pic_inited)
+			return 0x80;
 		uint8_t const v = m_pic->acknowledge();
 		return v >= 0x80 ? v : 0x80;
 	}
+	bool m_pic_inited = false;
 };
 
 
@@ -2037,9 +2046,15 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	// The sources still reach the CPU the old way for now: moving them
 	// onto the IR lines has to happen in one piece, and the machine has
 	// to keep booting in between.
-	if (m_legacy_bios && ACCESSING_BITS_0_7
+	// Both firmware families program it here; ICW1 (bit 4 on the command
+	// port) is the moment the controller takes charge of the vectors.
+	if (ACCESSING_BITS_0_7
 			&& ((offset << 1) == 0x2200 || (offset << 1) == 0x2202))
+	{
 		m_pic->write(((offset << 1) == 0x2200) ? 0 : 1, data & 0xff);
+		if ((offset << 1) == 0x2200 && BIT(data, 4))
+			m_pic_inited = true;
+	}
 
 	// the gate array's end-of-interrupt ports for the two counters
 	if (m_legacy_bios && m_pic_ready && ACCESSING_BITS_0_7)
@@ -2263,6 +2278,7 @@ void wltc_state::machine_reset()
 {
 	m_fseg_logged.assign(0x8000, 0);
 	m_tick_int = false;
+	m_pic_inited = false;
 	m_kb_status = 0x01;
 	m_kb_ready_again = false;
 	m_kb_rx = 0;
