@@ -3007,7 +3007,14 @@ static INPUT_PORTS_START( wltc )
 	// Shift+Ctrl+F1..F12, exactly as on the machine (the modifiers
 	// travel as their own make/break codes and the firmware combines
 	// them). The four codes that used to sit here as "F13-F16" belong
-	// to other keys: TAB and three specials still to be named.
+	// to other keys: TAB and three specials still to be named. The
+	// maintenance manual's operator-control list (3.1) names the top
+	// row HELP, PAPER BACK, PAPER IN, PRINT, ERASE - the two PAPER keys
+	// feed the integral thermal printer's platen (held-down motion
+	// controls, most likely wired to the printer, not code-sending
+	// keys) and stay unmapped until the printer exists; ERASE is the
+	// screen-refresh key ("erases damaged screen display and replaces
+	// it with refreshed display").
 	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("TAB") PORT_CODE(KEYCODE_TAB)
 	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("HELP? (codice 70, da verificare)") PORT_CODE(KEYCODE_F14)
 	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_KEYBOARD) PORT_NAME("ERASE? (codice 71, da verificare)") PORT_CODE(KEYCODE_F15)
