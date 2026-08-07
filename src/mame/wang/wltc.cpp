@@ -1201,7 +1201,9 @@ private:
 	emu_timer *m_kb_timer = nullptr;
 	void pic_int_w(int state)
 	{
-		if (!m_legacy_bios)
+		// The controller drives the CPU when it is in charge: always for
+		// the 4.02.03 firmware, and after the handover for the 1986 one.
+		if (!m_legacy_bios || m_pic_ready)
 			m_maincpu->set_input_line(0, state ? ASSERT_LINE : CLEAR_LINE);
 	}
 	// Sources as states rather than pulses.
@@ -1757,13 +1759,16 @@ private:
 		if (N == 0)
 		{
 			// Counter 0 still reaches the controller's ir0 as it always did.
-			// Cutting it off under the 1986 BIOS was meant to stop it flooding
-			// the controller once the sources are handed over - harmless while
-			// they are not, but it is the only behavioural change among the
-			// recent commits, and the DOS command processor stopped starting
-			// for the machine's owner right after them. Restored until that is
-			// understood; the handover work will have to gate it another way.
-			m_pic->ir0_w(state);
+			// Straight to ir0 for the 4.02.03 firmware and for the 1986
+			// POST before the handover. After the handover the counter is
+			// a level that is high half the time, and a level-triggered
+			// controller would re-fire on it for ever: route it through
+			// set_source, which latches only the rising edge for the two
+			// counters and drops it on the gate array's own EOI port.
+			if (m_legacy_bios && m_pic_ready)
+				set_source(0, state != 0);
+			else
+				m_pic->ir0_w(state);
 			return;
 		}
 		// the counter output is a level: the request follows it
@@ -1925,11 +1930,16 @@ private:
 		// the 1986 POST installs its timer handler on vector 0x20
 		// (F0ECB: [0080] = F000:0F67) before sti. The unprogrammed 8259
 		// returns junk below either base.
-		// the 1986 firmware never initialises the 8259 at all: its
-		// interrupts carry the vector of whichever gate-array source
-		// fired last
+		// the 1986 firmware carries the gate array's fixed vector until it
+		// programs the 8259; after the handover the controller answers,
+		// falling back to the last gate-array vector for anything below
+		// its base (nothing should ask before ICW2 sets the base)
 		if (m_legacy_bios)
-			return m_gate_vector;
+		{
+			if (!m_pic_ready)
+				return m_gate_vector;
+			return m_pic->acknowledge();
+		}
 		// Before ICW1 the 8259 cannot deliver anything (measured: asking
 		// MAME's device anyway returned 0xcd, whose IVT slot is still
 		// zeroed RAM - the CPU fell to 0000:0000 and marched through the
@@ -1942,6 +1952,7 @@ private:
 		return v >= 0x80 ? v : 0x80;
 	}
 	bool m_pic_inited = false;
+	bool m_expect_icw2 = false;
 };
 
 
@@ -2726,7 +2737,38 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	{
 		m_pic->write(((offset << 1) == 0x2200) ? 0 : 1, data & 0xff);
 		if ((offset << 1) == 0x2200 && BIT(data, 4))
+		{
 			m_pic_inited = true;
+			m_expect_icw2 = true;   // il prossimo 0x2202 e' ICW2 (la base)
+		}
+		// Legacy handover on the SECOND programming: the POST sets base
+		// 0x20 to run its own tests on the fixed-vector path (proven to
+		// boot), and the loaded system reprograms base 0x80 once it is
+		// up - by then every handler is installed and clears the gate
+		// array's interrupt latch, so the level-triggered controller no
+		// longer floods. Handing over at the first ICW1 (base 0x20) let
+		// counter 0 flood vector 0x20 forever, because the handler that
+		// writes the EOI port was not installed yet (measured: 335k
+		// acknowledges of 0x20 and the boot never reached the menu).
+		if ((offset << 1) == 0x2202 && m_expect_icw2)
+		{
+			m_expect_icw2 = false;
+			// Gated behind a configuration switch while the handover is
+			// still being brought up: the default keeps the proven
+			// fixed-vector path that boots. With the switch on, the
+			// base-0x80 trigger clears the counter-0 flood that killed
+			// every earlier attempt at ICW1 (its tick handler at E0119
+			// does write the 2c16 EOI); what remains is a counter-2 /
+			// vector 0x81 storm in the loaded system's handlers at
+			// F000:Cxxx, which slows the machine to a crawl.
+			if (m_legacy_bios && !m_pic_ready && (data & 0xff) == 0x80
+					&& BIT(ioport("CONFIG")->read(), 3))
+			{
+				m_pic_ready = true;
+				logerror("8259 handover (base 0x80) a %s\n",
+						machine().time().as_string(6));
+			}
+		}
 	}
 
 	// the gate array's end-of-interrupt ports for the two counters
@@ -3509,6 +3551,13 @@ static INPUT_PORTS_START( wltc )
 	PORT_CONFSETTING(      0x0000, "stub to 0x63" )
 	PORT_CONFSETTING(      0x0002, "run the table as code" )
 	PORT_CONFSETTING(      0x0004, "enter the body with CS=E35F" )
+	// experimental: hand the 1986 firmware's interrupts to the real 8259
+	// at the base-0x80 programming. Off by default (the fixed-vector path
+	// boots); on, it clears the counter-0 flood but a counter-2 storm
+	// remains - see NOTE-RICOGNIZIONE.
+	PORT_CONFNAME( 0x0008, 0x0000, "8259 handover (sperimentale)" )
+	PORT_CONFSETTING(      0x0000, "off (percorso a vettore fisso)" )
+	PORT_CONFSETTING(      0x0008, "on (base 0x80)" )
 
 	// National layout of the HOST keyboard: the driver patches the
 	// loaded translation tables (Wang lists + XLAT's IS archive) the way
