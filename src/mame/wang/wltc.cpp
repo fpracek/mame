@@ -56,6 +56,7 @@
 extern emu::detail::device_type_impl<nscsi_harddisk_device> const WANG_WINCHESTER;
 extern emu::detail::device_type_impl<nscsi_full_device> const WANG_SCSI_FLOPPY;
 extern emu::detail::device_type_impl<nscsi_full_device> const WANG_SCSI_FLOPPY35;
+extern emu::detail::device_type_impl<nscsi_full_device> const WANG_SCSI_FLOPPY_RAW;
 
 namespace {
 
@@ -522,6 +523,425 @@ private:
 	int m_expected = 0;
 	uint8_t m_fdc_command = 0;
 	bool m_drq = false;
+	bool m_sending = false;
+	bool m_unit_attention = true;
+};
+
+// ---------------------------------------------------------------------
+// The same drive-A bridge over a RAW host file - or, on Linux, a block
+// device such as a USB floppy drive's /dev/sdX. MAME's floppy stack
+// keeps the image in memory and writes it back at unload; an appliance
+// wants the physical diskette current at every moment, so this variant
+// skips the stack entirely: it answers the same A0 protocol with a
+// synthetic 765 whose sectors are pread/pwrite on the host file, every
+// write flushed as it happens. Geometry comes from the file size
+// (368640 = 40x2x9, 737280 = 80x2x9, 1474560 = 80x2x18).
+//
+// READS work end to end: the machine boots from a raw file through this
+// device and reads it live. WRITES are not there yet, and it is not a
+// regression - Drive A writes have never worked in this driver (the
+// original wangfdd leaves the image untouched too, measured). The A0
+// write command reaches here and takes the good path, but the Wang
+// never arms the 5380 for DMA-send afterwards (no start-DMA-send strobe
+// follows the command), so no byte ever reaches scsi_put_data. The
+// disk driver arms DMA-send for a Winchester WRITE_6 - that path works -
+// so the floppy-over-SCSI driver expects a different handshake for a
+// forwarded 765 write (likely a phase/interrupt cue from the bridge
+// that this synthetic target does not yet raise). That is the bounded
+// next step; see NOTE-RICOGNIZIONE.
+// ---------------------------------------------------------------------
+class wang_scsi_floppy_raw_device : public nscsi_full_device, public device_image_interface
+{
+public:
+	wang_scsi_floppy_raw_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0)
+		: nscsi_full_device(mconfig, WANG_SCSI_FLOPPY_RAW, tag, owner, clock)
+		, device_image_interface(mconfig, *this)
+	{ }
+
+	// image interface: a raw sector file, read/write, kept open
+	virtual bool is_readable() const noexcept override { return true; }
+	virtual bool is_writeable() const noexcept override { return true; }
+	virtual bool is_creatable() const noexcept override { return false; }
+	virtual bool is_reset_on_load() const noexcept override { return false; }
+	virtual bool support_command_line_image_creation() const noexcept override { return false; }
+	virtual const char *image_interface() const noexcept override { return "floppy_5_25"; }
+	virtual const char *file_extensions() const noexcept override { return "img,ima,dsk,raw"; }
+	virtual const char *image_type_name() const noexcept override { return "floppydisk"; }
+	virtual const char *image_brief_type_name() const noexcept override { return "flop"; }
+
+	virtual std::pair<std::error_condition, std::string> call_load() override
+	{
+		uint64_t size = 0;
+		if (image_core_file().length(size))
+			return std::make_pair(image_error::UNSPECIFIED, "impossibile leggere la dimensione");
+		// geometry by size; anything unrecognized becomes 512-byte
+		// sectors, 9 per track, two heads, cylinders to fit
+		m_spt = 9; m_heads = 2;
+		if (size == 1474560)
+			m_spt = 18;
+		m_cylinders = int(size / (512 * m_heads * m_spt));
+		m_size = size;
+		m_unit_attention = true;
+		logerror("drive A raw: %s, %d cilindri x %d teste x %d settori\n",
+				filename(), m_cylinders, m_heads, m_spt);
+		return std::make_pair(std::error_condition(), std::string());
+	}
+	virtual void call_unload() override
+	{
+		m_size = 0;
+		m_unit_attention = true;
+	}
+
+protected:
+	virtual void device_start() override ATTR_COLD
+	{
+		nscsi_full_device::device_start();
+		m_finish = timer_alloc(FUNC(wang_scsi_floppy_raw_device::finish_cb), this);
+		save_item(NAME(m_cyl));
+		save_item(NAME(m_unit_attention));
+	}
+
+	virtual void device_reset() override ATTR_COLD
+	{
+		nscsi_full_device::device_reset();
+		m_unit_attention = true;
+		set_status_delay(attotime::from_usec(500));
+		set_data_phase_timeout(attotime::from_msec(10));
+	}
+
+	virtual bool scsi_command_done(uint8_t command, uint8_t length) override
+	{
+		if (command >= 0xa0 && command <= 0xa3)
+			return length >= 3 && length == m_scsi_cmdbuf[2] + 1;
+		return nscsi_full_device::scsi_command_done(command, length);
+	}
+
+	virtual void scsi_command() override
+	{
+		m_sending = false;
+		switch (m_scsi_cmdbuf[0])
+		{
+		case SC_TEST_UNIT_READY:
+			scsi_status_complete(SS_GOOD);
+			return;
+
+		case SC_REQUEST_SENSE:
+		{
+			std::fill(std::begin(m_scsi_sense_buffer), std::end(m_scsi_sense_buffer), 0);
+			m_scsi_sense_buffer[0] = 0x70;
+			m_scsi_sense_buffer[7] = 8;
+			if (m_unit_attention)
+			{
+				m_scsi_sense_buffer[2] = SK_UNIT_ATTENTION;
+				m_scsi_sense_buffer[12] = 0x29;
+				m_unit_attention = false;
+			}
+			int const alloc = m_scsi_cmdbuf[4];
+			scsi_data_in(SBUF_SENSE, std::min(16, alloc ? alloc : 4));
+			scsi_status_complete(SS_GOOD);
+			return;
+		}
+
+		case 0x01: // rezero unit
+			m_unit_attention = false;
+			m_cyl = 0;
+			scsi_status_complete(SS_GOOD);
+			return;
+
+		case SC_INQUIRY:
+		{
+			int const alloc = m_scsi_cmdbuf[4];
+			std::fill_n(m_scsi_cmdbuf, 36, 0);
+			m_scsi_cmdbuf[0] = 0x80;    // removable direct access (byte 0, alla Wang)
+			m_scsi_cmdbuf[2] = 0x01;
+			m_scsi_cmdbuf[3] = 0x01;
+			m_scsi_cmdbuf[4] = 31;
+			std::memcpy(&m_scsi_cmdbuf[8],  "WANG    ", 8);
+			std::memcpy(&m_scsi_cmdbuf[16], "FDD RAW         ", 16);
+			std::memcpy(&m_scsi_cmdbuf[32], "1.00", 4);
+			scsi_data_in(SBUF_MAIN, std::min<int>(36, alloc ? alloc : 4));
+			scsi_status_complete(SS_GOOD);
+			return;
+		}
+
+		case SC_MODE_SENSE_6:
+		{
+			int const alloc = m_scsi_cmdbuf[4];
+			int const page = m_scsi_cmdbuf[2] & 0x3f;
+			uint32_t const blocks = uint32_t(m_cylinders) * m_heads * m_spt;
+			uint8_t buf[36];
+			std::fill_n(buf, sizeof(buf), 0);
+			buf[3] = 8;
+			buf[5] = (blocks >> 16) & 0xff;
+			buf[6] = (blocks >> 8) & 0xff;
+			buf[7] = blocks & 0xff;
+			buf[10] = 0x02;
+			int len = 12;
+			if (page == 0x04 || page == 0x3f)
+			{
+				buf[len + 0] = 0x04;
+				buf[len + 1] = 0x16;
+				buf[len + 3] = (m_cylinders >> 8) & 0xff;
+				buf[len + 4] = m_cylinders & 0xff;
+				buf[len + 5] = m_heads;
+				len += 24;
+			}
+			else if (page == 0x01)
+			{
+				buf[len + 0] = 0x01;
+				buf[len + 1] = 0x0a;
+				len += 12;
+			}
+			else
+			{
+				scsi_status_complete(SS_CHECK_CONDITION);
+				sense(false, SK_ILLEGAL_REQUEST);
+				return;
+			}
+			buf[0] = len - 1;
+			m_unit_attention = false;
+			std::copy_n(buf, len, m_scsi_cmdbuf);
+			scsi_data_in(SBUF_MAIN, std::min<int>(len, alloc ? alloc : 4));
+			scsi_status_complete(SS_GOOD);
+			return;
+		}
+
+		case 0xa0:
+		{
+			m_unit_attention = false;
+			uint8_t const cmd = m_scsi_cmdbuf[4] & 0x1f;
+			m_data.clear();
+			m_res_n = 0;
+			m_write_pos = 0;
+			m_write_len = 0;
+
+			std::string cdb;
+			for (int i = 0; i < m_scsi_cmdsize; i++)
+				cdb += util::string_format(" %02x", m_scsi_cmdbuf[i]);
+			logerror("drive A raw comando:%s\n", cdb);
+
+			switch (cmd)
+			{
+			case 0x03: // specify: nessun risultato
+				m_finish->adjust(attotime::from_usec(100));
+				return;
+
+			case 0x07: // recalibrate
+				m_cyl = 0;
+				m_res[0] = 0x20 | (m_scsi_cmdbuf[5] & 3);   // seek end
+				m_res[1] = 0;
+				m_res_n = 2;
+				m_finish->adjust(attotime::from_msec(2));
+				return;
+
+			case 0x0f: // seek
+				m_cyl = m_scsi_cmdbuf[6];
+				m_res[0] = 0x20 | (m_scsi_cmdbuf[5] & 3);
+				m_res[1] = m_cyl;
+				m_res_n = 2;
+				m_finish->adjust(attotime::from_msec(2));
+				return;
+
+			case 0x08: // sense interrupt status
+				m_res[0] = 0x20;
+				m_res[1] = m_cyl;
+				m_res_n = 2;
+				m_finish->adjust(attotime::from_usec(100));
+				return;
+
+			case 0x0a: // read ID
+			{
+				int const head = BIT(m_scsi_cmdbuf[5], 2);
+				risultato_chrn(m_scsi_cmdbuf[5], m_cyl, head, 1, 2);
+				m_finish->adjust(attotime::from_usec(200));
+				return;
+			}
+
+			case 0x06: // read data (0x46/0x66 col bit MFM/MT)
+			{
+				int const c = m_scsi_cmdbuf[6], h = m_scsi_cmdbuf[7];
+				int const r = m_scsi_cmdbuf[8], sz = m_scsi_cmdbuf[9];
+				int const eot = m_scsi_cmdbuf[10];
+				int const nsec = (eot >= r) ? (eot - r + 1) : 0;
+				uint32_t const bytes = nsec * (128 << sz);
+				if (!exists() || !dentro(c, h, r, nsec))
+				{
+					errore_settore(m_scsi_cmdbuf[5], c, h, r, sz);
+					m_finish->adjust(attotime::from_usec(200));
+					return;
+				}
+				m_data.resize(bytes);
+				util::read_at(image_core_file(), offset_settore(c, h, r), m_data.data(), bytes);
+				risultato_chrn(m_scsi_cmdbuf[5], c, h, eot + 1, sz);
+				// il tempo di una lettura vera: ~n giri di piatto emulati
+				m_finish->adjust(attotime::from_msec(4 + 2 * nsec));
+				return;
+			}
+
+			case 0x05: // write data (0x45/0x65)
+			{
+				int const c = m_scsi_cmdbuf[6], h = m_scsi_cmdbuf[7];
+				int const r = m_scsi_cmdbuf[8], sz = m_scsi_cmdbuf[9];
+				int const eot = m_scsi_cmdbuf[10];
+				int const nsec = (eot >= r) ? (eot - r + 1) : 0;
+				uint32_t const bytes = nsec * (128 << sz);
+				if (!exists() || is_readonly() || !dentro(c, h, r, nsec))
+				{
+					errore_settore(m_scsi_cmdbuf[5], c, h, r, sz, true);
+					m_finish->adjust(attotime::from_usec(200));
+					return;
+				}
+				// i byte arrivano in scsi_put_data e vengono scritti sul
+				// file HOST settore per settore, con flush immediato: e'
+				// il punto della variante raw. Come nscsi_harddisk: la
+				// fase dati e il messaggio di stato si accodano insieme
+				// e la coda di controllo li serve in ordine (tutti i
+				// byte via scsi_put_data, poi lo stato), quindi non serve
+				// aspettare con un timer.
+				m_write_off = offset_settore(c, h, r);
+				m_write_len = bytes;
+				m_write_pos = 0;
+				m_write_buf.assign(512, 0);
+				risultato_chrn(m_scsi_cmdbuf[5], c, h, eot + 1, sz);
+				scsi_data_out(SBUF_MAIN, bytes);
+				// il messaggio di stato lo manda scsi_put_data quando arriva
+				// l'ultimo byte; questo e' solo un paracadute molto lasco
+				m_finish->adjust(attotime::from_msec(500));
+				return;
+			}
+
+			case 0x0d: // format track: riempi di zeri
+			{
+				int const head = BIT(m_scsi_cmdbuf[5], 2);
+				if (exists() && !is_readonly() && m_cyl < m_cylinders)
+				{
+					std::vector<uint8_t> vuoto(512 * m_spt, 0xe5);
+					util::write_at(image_core_file(), offset_settore(m_cyl, head, 1), vuoto.data(), vuoto.size());
+					image_core_file().flush();
+				}
+				risultato_chrn(m_scsi_cmdbuf[5], m_cyl, head, 1, 2);
+				m_finish->adjust(attotime::from_msec(50));
+				return;
+			}
+
+			default:
+				logerror("drive A raw: comando 765 %02x non gestito\n", m_scsi_cmdbuf[4]);
+				m_finish->adjust(attotime::from_usec(100));
+				return;
+			}
+		}
+
+		case 0xa1:
+		case 0xa2:
+		case 0xa3:
+			m_unit_attention = false;
+			scsi_status_complete(SS_GOOD);
+			return;
+		}
+
+		nscsi_full_device::scsi_command();
+	}
+
+	virtual uint8_t scsi_get_data(int id, int pos) override
+	{
+		if (m_sending && id == SBUF_MAIN)
+		{
+			if (pos + 1 >= int(m_data.size()))
+				m_sending = false;
+			return (pos < int(m_data.size())) ? m_data[pos] : 0;
+		}
+		return nscsi_full_device::scsi_get_data(id, pos);
+	}
+
+	virtual void scsi_put_data(int id, int pos, uint8_t data) override
+	{
+		if (id == SBUF_MAIN && m_write_len)
+		{
+			m_write_buf[pos & 511] = data;
+			if ((pos & 511) == 511 || pos + 1 == int(m_write_len))
+			{
+				// settore completo (o coda): SUBITO sul file host, con
+				// flush, cosi' il dischetto fisico e' sempre corrente
+				int const base = pos & ~511;
+				util::write_at(image_core_file(), m_write_off + base,
+						m_write_buf.data(), (pos & 511) + 1);
+				image_core_file().flush();
+			}
+			if (pos + 1 == int(m_write_len))
+			{
+				logerror("drive A raw: scritti %u byte a offset %u (tempo reale)\n",
+						m_write_len, unsigned(m_write_off));
+				m_write_len = 0;
+				m_finish->adjust(attotime::zero);   // manda il messaggio ora
+			}
+			return;
+		}
+		nscsi_full_device::scsi_put_data(id, pos, data);
+	}
+
+private:
+	bool dentro(int c, int h, int r, int nsec) const
+	{
+		return c < m_cylinders && h < m_heads && r >= 1 && (r - 1 + nsec) <= m_spt;
+	}
+	uint64_t offset_settore(int c, int h, int r) const
+	{
+		return (uint64_t(c) * m_heads + h) * m_spt * 512 + uint64_t(r - 1) * 512;
+	}
+	void risultato_chrn(uint8_t unit, int c, int h, int r, int sz)
+	{
+		m_res[0] = unit & 7;          // ST0: terminazione normale
+		m_res[1] = 0;                 // ST1
+		m_res[2] = 0;                 // ST2
+		m_res[3] = c;
+		m_res[4] = h;
+		m_res[5] = r;
+		m_res[6] = sz;
+		m_res_n = 7;
+	}
+	void errore_settore(uint8_t unit, int c, int h, int r, int sz, bool scrittura = false)
+	{
+		m_res[0] = 0x40 | (unit & 7); // terminazione anomala
+		m_res[1] = scrittura && is_readonly() ? 0x02 : 0x04;   // NW / no data
+		m_res[2] = 0;
+		m_res[3] = c; m_res[4] = h; m_res[5] = r; m_res[6] = sz;
+		m_res_n = 7;
+	}
+	// build the extended-message result and queue it now, straight after
+	// whatever data phase was queued first - the write path uses this so
+	// the status waits for the data-out bytes without a timer
+	void invia_messaggio()
+	{
+		uint8_t msg[16];
+		int const len = std::max(7, 5 + m_res_n);
+		std::fill_n(msg, len, 0);
+		msg[0] = 0x01;
+		msg[1] = m_res_n + 3;
+		for (int i = 0; i < m_res_n; i++)
+			msg[5 + i] = m_res[i];
+		scsi_status_complete_msg(SS_GOOD, msg, len);
+	}
+	TIMER_CALLBACK_MEMBER(finish_cb)
+	{
+		if (!m_data.empty())
+		{
+			m_sending = true;
+			scsi_data_in(SBUF_MAIN, m_data.size());
+		}
+		invia_messaggio();
+	}
+
+	emu_timer *m_finish = nullptr;
+	std::vector<uint8_t> m_data;
+	std::vector<uint8_t> m_write_buf;
+	uint64_t m_write_off = 0;
+	uint32_t m_write_len = 0;
+	uint32_t m_write_pos = 0;
+	uint8_t m_res[8] = {};
+	int m_res_n = 0;
+	int m_cyl = 0;
+	int m_cylinders = 40, m_heads = 2, m_spt = 9;
+	uint64_t m_size = 0;
 	bool m_sending = false;
 	bool m_unit_attention = true;
 };
@@ -3201,6 +3621,7 @@ void wltc_state::wltc(machine_config &config)
 		conn.option_add("winchester", WANG_WINCHESTER);
 		conn.option_add("wangfdd", WANG_SCSI_FLOPPY);
 		conn.option_add("wangfdd35", WANG_SCSI_FLOPPY35);
+		conn.option_add("wangfddraw", WANG_SCSI_FLOPPY_RAW);
 		if (id == 0)
 			conn.set_default_option("winchester");
 	}
@@ -3327,6 +3748,7 @@ protected:
 
 DEFINE_DEVICE_TYPE_PRIVATE(WANG_SCSI_FLOPPY, nscsi_full_device, wang_scsi_floppy_device, "wang_scsi_floppy", "Wang LapTop external floppy drive")
 DEFINE_DEVICE_TYPE_PRIVATE(WANG_SCSI_FLOPPY35, nscsi_full_device, wang_scsi_floppy35_device, "wang_scsi_floppy35", "Wang LapTop external floppy drive (3.5\")")
+DEFINE_DEVICE_TYPE_PRIVATE(WANG_SCSI_FLOPPY_RAW, nscsi_full_device, wang_scsi_floppy_raw_device, "wang_scsi_floppy_raw", "Wang LapTop external floppy drive (raw host file)")
 
 
 // The clones only preset the LAYOUT machine configuration, so the
