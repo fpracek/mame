@@ -546,7 +546,8 @@ public:
 		m_fram(*this, "fram"),
 		m_textram(*this, "textram"),
 		m_monoram(*this, "monoram"),
-		m_keys(*this, "KB%u", 0U)
+		m_keys(*this, "KB%u", 0U),
+		m_layout(*this, "LAYOUT")
 	{ }
 
 	void wltc(machine_config &config);
@@ -559,7 +560,7 @@ protected:
 		m_rtc_timer = timer_alloc(FUNC(wltc_state::rtc_periodic), this);
 		m_kb_poll = timer_alloc(FUNC(wltc_state::kb_poll_cb), this);
 		m_dma_timer = timer_alloc(FUNC(wltc_state::dma_service_cb), this);
-
+		m_layout_timer = timer_alloc(FUNC(wltc_state::layout_cb), this);
 	}
 	virtual void machine_reset() override ATTR_COLD;
 
@@ -997,6 +998,231 @@ private:
 	uint8_t m_kb_rx = 0;
 	std::deque<uint8_t> m_kb_replies;
 	emu_timer *m_kb_poll = nullptr;
+
+	// ------------------------------------------------------------------
+	// National keyboard layouts, applied from the driver.
+	//
+	// The real machine gets its layout from software - national XLAT and
+	// BIOS.SYS builds carry different translation tables - and the
+	// preserved diskettes are the American build. The driver therefore
+	// patches the loaded tables the way a national build would have
+	// shipped them, on both sides of the machine:
+	//
+	//  - Wang mode: the BIOS translation block that [E358:0002] points
+	//    at (direct key table + paired base/shift character lists),
+	//    found by content and repatched every couple of seconds because
+	//    SYSMODE reloads it;
+	//  - Industry Standard mode: XLAT's own layout archive (the segment
+	//    [EBC8:0002] points at), found by the signature of its ten alias
+	//    pairs and patched cell by cell, every original value acting as
+	//    a guard so a different XLAT build suspends the patches instead
+	//    of corrupting them.
+	//
+	// The recipes are the ones validated byte-by-byte with the echo
+	// tests of 6/8/2026 (IT 20/20, DE 24/24, in both modes).
+	//
+	// The choice is the LAYOUT machine configuration setting, read at
+	// reset; the wltcit / wltcde clone machines only change its default
+	// so the layout can be picked straight from the command line.
+	required_ioport m_layout;
+	emu_timer *m_layout_timer = nullptr;
+	uint8_t m_layout_active = 0;
+	std::vector<std::pair<uint32_t, uint8_t>> m_kb_recipe;
+	uint32_t m_kb_recipe_base = 0;
+	uint32_t m_is_arch_base = 0;
+	bool m_is_arch_valido = false;
+	bool m_is_arch_avvisato = false;
+
+	struct patch_is { uint16_t off; uint8_t orig; uint8_t nuovo; };
+	static constexpr uint8_t FIRMA_IS[16] = {
+		0x0a, 0x9b, 0x80, 0xb5, 0x81, 0x1b, 0x90, 0x35,
+		0x91, 0x1e, 0xa2, 0xa4, 0x83, 0x24, 0x93, 0xa5
+	};
+	static constexpr patch_is PATCH_IS_IT[] = {
+		{ 0x0054, 0x4e, 0x59 }, { 0x0013, 0x53, 0x50 },   // ripuntamenti indice
+		{ 0x042a, 0x18, 0x27 }, { 0x042b, 0x00, 0x3f },   // riga apostrofo/? (ex ESC)
+		{ 0x0455, 0x60, 0x5c }, { 0x045c, 0x7e, 0x7c },   // barra e pipe
+		{ 0x045b, 0x3b, 0x40 },                           // o' -> @
+		{ 0x045a, 0x27, 0x23 }, { 0x0461, 0x22, 0xf8 },   // a' -> #, shift gradi
+		{ 0x0458, 0x2f, 0x2d }, { 0x045f, 0x3f, 0x5f },   // trattino, _
+		{ 0x047d, 0x7b, 0x5d },                           // shift e' -> ]
+		{ 0x0475, 0x5d, 0x2b }, { 0x047b, 0x7d, 0x2a },   // + e *
+		{ 0x0191, 0x40, 0x22 }, { 0x0187, 0x5e, 0x26 },   // shift 2 " / 6 &
+		{ 0x0207, 0x26, 0x2f }, { 0x0209, 0x2a, 0x28 },   // shift 7 / 8
+		{ 0x020b, 0x28, 0x29 }, { 0x0213, 0x29, 0x3d },   // shift 9 / 0
+		{ 0x045d, 0x3c, 0x3b }, { 0x045e, 0x3e, 0x3a },   // shift , ; e . :
+	};
+	static constexpr patch_is PATCH_IS_DE[] = {
+		{ 0x003f, 0x2c, 0x2b }, { 0x005a, 0x2b, 0x2c },   // y/z scambiati
+		{ 0x0013, 0x53, 0x50 }, { 0x0054, 0x4e, 0x62 },   // esszett e cancelletto
+		{ 0x042a, 0x18, 0xe1 }, { 0x042b, 0x00, 0x3f },   // riga esszett/?
+		{ 0x0474, 0x5d, 0x23 }, { 0x047a, 0x7d, 0x27 },   // riga #/apostrofo
+		{ 0x045b, 0x3b, 0x94 }, { 0x0462, 0x3a, 0x99 },   // o dieresi
+		{ 0x045a, 0x27, 0x84 }, { 0x0461, 0x22, 0x8e },   // a dieresi
+		{ 0x0477, 0x5b, 0x81 }, { 0x047d, 0x7b, 0x9a },   // u dieresi
+		{ 0x0458, 0x2f, 0x2d }, { 0x045f, 0x3f, 0x5f },   // trattino, _
+		{ 0x0475, 0x5d, 0x2b }, { 0x047b, 0x7d, 0x2a },   // + e *
+		{ 0x0455, 0x60, 0x5e }, { 0x045c, 0x7e, 0xf8 },   // circonflesso, gradi
+		{ 0x01fb, 0x3d, 0x5c }, { 0x020d, 0x2b, 0x7c },   // barra e pipe (accento)
+		{ 0x0191, 0x40, 0x22 }, { 0x0187, 0x5e, 0x26 },   // shift 2 " / 6 &
+		{ 0x0207, 0x26, 0x2f }, { 0x0209, 0x2a, 0x28 },   // shift 7 / 8
+		{ 0x020b, 0x28, 0x29 }, { 0x0213, 0x29, 0x3d },   // shift 9 / 0
+		{ 0x045d, 0x3c, 0x3b }, { 0x045e, 0x3e, 0x3a },   // shift , ; e . :
+	};
+
+	void costruisci_ricetta_wang(uint32_t B)
+	{
+		address_space &sp = m_maincpu->space(AS_PROGRAM);
+		auto rd = [&sp](uint32_t a) { return sp.read_byte(a); };
+		auto put = [this](uint32_t a, uint8_t v) { m_kb_recipe.emplace_back(a, v); };
+		auto trova = [&](const char *pat) -> int
+		{
+			int const len = int(strlen(pat));
+			for (int off = 0x100; off <= 0x300; off++)
+			{
+				bool ok = true;
+				for (int i = 0; i < len && ok; i++)
+					ok = rd(B + off + i) == uint8_t(pat[i]);
+				if (ok)
+					return off;
+			}
+			return -1;
+		};
+		m_kb_recipe.clear();
+		int const l1 = trova("357890;',");
+		int const l2 = trova("=1246/-+");
+		int const lb = trova("[]\\`");
+		if (l1 < 0 || l2 < 0)
+			return;                       // liste non ancora caricate
+		int const s1 = l1 + 10, s2 = l2 + 7;
+		auto coppia = [&](int basi, int shiftate, char base_ch, uint8_t nuovo)
+		{
+			for (int i = 0; i < 10; i++)
+				if (rd(B + basi + i) == uint8_t(base_ch))
+					{ put(B + shiftate + i, nuovo); return; }
+		};
+		// cifre e punteggiatura, comuni ai due layout continentali
+		coppia(l1, s1, '7', '/'); coppia(l1, s1, '8', '(');
+		coppia(l1, s1, '9', ')'); coppia(l1, s1, '0', '=');
+		coppia(l2, s2, '2', '"'); coppia(l2, s2, '6', '&');
+		coppia(l1, s1, ',', ';'); coppia(l1, s1, '.', ':');
+		if (m_layout_active == 1)         // italiana
+		{
+			uint8_t const n_apice = rd(B + 0x45), n_kpmeno = rd(B + 0x13), n_btick = rd(B + 0x33);
+			put(B + 0x13, n_apice);       // tasto '? -> apostrofo
+			put(B + 0x37, n_kpmeno);      // tasto trattino -> meno
+			put(B + 0x45, n_btick);       // tasto a' -> cella del backtick (base #)
+			put(B + 0x33, 0x42);          // tasto sx dell'1 -> cella backslash
+			put(B + 0x54, 0x42);          // tasto u' -> idem
+			coppia(l1, s1, '\'', '?');
+			for (int i = 0; i < 10; i++)
+				if (rd(B + l1 + i) == ';')
+					put(B + l1 + i, '@'); // tasto o' -> @
+			if (lb >= 0)
+			{
+				put(B + lb + 3, '#'); put(B + lb + 4, ']');
+				put(B + lb + 1, '+'); put(B + lb + 5, '*');
+				put(B + lb + 7, 0x5c);
+			}
+		}
+		else                              // tedesca
+		{
+			uint8_t const ny = rd(B + 0x5a), nz = rd(B + 0x3f);
+			put(B + 0x5a, nz); put(B + 0x3f, ny);   // QWERTZ
+			for (int i = 0; i < 10; i++)
+			{
+				uint8_t const c = rd(B + l1 + i);
+				if (c == ';')  { put(B + l1 + i, 0x94); put(B + s1 + i, 0x99); }
+				if (c == '\'') { put(B + l1 + i, 0x84); put(B + s1 + i, 0x8e); }
+			}
+			put(B + 0x13, 0x24);          // tasto esszett -> cella "="
+			put(B + 0x64, 0x2a);          // tasto accento -> cella "-"
+			for (int i = 0; i < 8; i++)
+			{
+				uint8_t const c = rd(B + l2 + i);
+				if (c == '=') { put(B + l2 + i, 0xe1); put(B + s2 + i, '?'); }
+				if (c == '-') { put(B + l2 + i, 0x5c); put(B + s2 + i, 0x7c); }
+				if (c == '/') { put(B + l2 + i, '-');  put(B + s2 + i, '_'); }
+			}
+			if (lb >= 0)
+			{
+				put(B + lb + 0, 0x81); put(B + lb + 4, 0x9a);
+				put(B + lb + 1, '+');  put(B + lb + 5, '*');
+				put(B + lb + 3, 0x5e); put(B + lb + 7, 0xf8);
+				put(B + lb + 2, '#');  put(B + lb + 6, '\'');
+			}
+			put(B + 0x54, 0x42);          // tasto # del PC -> cella backslash
+		}
+	}
+
+	TIMER_CALLBACK_MEMBER(layout_cb)
+	{
+		if (m_layout_active == 0)
+			return;
+		address_space &sp = m_maincpu->space(AS_PROGRAM);
+
+		// lato Wang: tabella del BIOS via [E358:0002]
+		uint16_t const seg = sp.read_word(0xe3582);
+		if (seg != 0x0000 && seg != 0xffff)
+		{
+			uint32_t const B = uint32_t(seg) << 4;
+			if (sp.read_byte(B + 0x5f) != 0x7f)   // sanita': il tasto q esiste
+			{
+				if (B != m_kb_recipe_base)
+				{
+					costruisci_ricetta_wang(B);
+					if (!m_kb_recipe.empty())
+					{
+						m_kb_recipe_base = B;
+						logerror("layout %s (Wang) applicato, tabella a %05X\n",
+								m_layout_active == 1 ? "IT" : "DE", B);
+					}
+				}
+				if (B == m_kb_recipe_base)
+					for (auto const &p : m_kb_recipe)
+						if (sp.read_byte(p.first) != p.second)
+							sp.write_byte(p.first, p.second);
+			}
+		}
+
+		// lato I.S.: archivio di XLAT, trovato per firma (coppie alias a +0x80)
+		if (!m_is_arch_base)
+		{
+			for (uint32_t base = 0xe0000; base < 0xeff00 && !m_is_arch_base; base += 16)
+			{
+				bool ok = true;
+				for (int i = 0; i < 16 && ok; i++)
+					ok = sp.read_byte(base + 0x80 + i) == FIRMA_IS[i];
+				if (ok)
+					m_is_arch_base = base;
+			}
+			if (m_is_arch_base)
+			{
+				m_is_arch_valido = true;
+				auto const *patch = (m_layout_active == 1) ? PATCH_IS_IT : PATCH_IS_DE;
+				int const n = (m_layout_active == 1) ? int(std::size(PATCH_IS_IT)) : int(std::size(PATCH_IS_DE));
+				for (int i = 0; i < n && m_is_arch_valido; i++)
+				{
+					uint8_t const v = sp.read_byte(m_is_arch_base + patch[i].off);
+					if (v != patch[i].orig && v != patch[i].nuovo)
+						m_is_arch_valido = false;
+				}
+				if (!m_is_arch_valido && !m_is_arch_avvisato)
+				{
+					m_is_arch_avvisato = true;
+					logerror("layout (I.S.): archivio XLAT diverso, patch sospese\n");
+				}
+			}
+		}
+		if (m_is_arch_base && m_is_arch_valido)
+		{
+			auto const *patch = (m_layout_active == 1) ? PATCH_IS_IT : PATCH_IS_DE;
+			int const n = (m_layout_active == 1) ? int(std::size(PATCH_IS_IT)) : int(std::size(PATCH_IS_DE));
+			for (int i = 0; i < n; i++)
+				if (sp.read_byte(m_is_arch_base + patch[i].off) != patch[i].nuovo)
+					sp.write_byte(m_is_arch_base + patch[i].off, patch[i].nuovo);
+		}
+	}
 	void kb_command(uint8_t cmd)
 	{
 		// the 0x1d/0x0a/0x1e sequence ends with an identify, answered
@@ -2279,6 +2505,15 @@ void wltc_state::machine_reset()
 	m_fseg_logged.assign(0x8000, 0);
 	m_tick_int = false;
 	m_pic_inited = false;
+	// the layout is read once per boot: changing the setting in the UI
+	// takes effect at the next soft reset
+	m_layout_active = m_layout->read() & 3;
+	m_kb_recipe_base = 0;
+	m_kb_recipe.clear();
+	m_is_arch_base = 0;
+	m_is_arch_valido = false;
+	m_is_arch_avvisato = false;
+	m_layout_timer->adjust(attotime::from_seconds(2), 0, attotime::from_seconds(2));
 	m_kb_status = 0x01;
 	m_kb_ready_again = false;
 	m_kb_rx = 0;
@@ -2787,6 +3022,36 @@ static INPUT_PORTS_START( wltc )
 	PORT_CONFSETTING(      0x0000, "stub to 0x63" )
 	PORT_CONFSETTING(      0x0002, "run the table as code" )
 	PORT_CONFSETTING(      0x0004, "enter the body with CS=E35F" )
+
+	// National layout of the HOST keyboard: the driver patches the
+	// loaded translation tables (Wang lists + XLAT's IS archive) the way
+	// a national software build would ship them. "US / WLTC nativa" is
+	// the untouched American build - also the right choice for a real
+	// WLTC replica keyboard, whose keys then do what their caps say.
+	// Read at reset; the wltcit / wltcde machines preset it.
+	PORT_START("LAYOUT")
+	PORT_CONFNAME( 0x0003, 0x0000, "Layout tastiera (host)" )
+	PORT_CONFSETTING(      0x0000, "US / WLTC nativa" )
+	PORT_CONFSETTING(      0x0001, "Italiana" )
+	PORT_CONFSETTING(      0x0002, "Tedesca" )
+INPUT_PORTS_END
+
+static INPUT_PORTS_START( wltcit )
+	PORT_INCLUDE( wltc )
+	PORT_MODIFY("LAYOUT")
+	PORT_CONFNAME( 0x0003, 0x0001, "Layout tastiera (host)" )
+	PORT_CONFSETTING(      0x0000, "US / WLTC nativa" )
+	PORT_CONFSETTING(      0x0001, "Italiana" )
+	PORT_CONFSETTING(      0x0002, "Tedesca" )
+INPUT_PORTS_END
+
+static INPUT_PORTS_START( wltcde )
+	PORT_INCLUDE( wltc )
+	PORT_MODIFY("LAYOUT")
+	PORT_CONFNAME( 0x0003, 0x0002, "Layout tastiera (host)" )
+	PORT_CONFSETTING(      0x0000, "US / WLTC nativa" )
+	PORT_CONFSETTING(      0x0001, "Italiana" )
+	PORT_CONFSETTING(      0x0002, "Tedesca" )
 INPUT_PORTS_END
 
 
@@ -2997,5 +3262,13 @@ DEFINE_DEVICE_TYPE_PRIVATE(WANG_SCSI_FLOPPY, nscsi_full_device, wang_scsi_floppy
 DEFINE_DEVICE_TYPE_PRIVATE(WANG_SCSI_FLOPPY35, nscsi_full_device, wang_scsi_floppy35_device, "wang_scsi_floppy35", "Wang LapTop external floppy drive (3.5\")")
 
 
-//    YEAR  NAME  PARENT  COMPAT  MACHINE  INPUT  CLASS       INIT        COMPANY              FULLNAME               FLAGS
-COMP( 1987, wltc, 0,      0,      wltc,    wltc,  wltc_state, empty_init, "Wang Laboratories", "Wang LapTop Computer", MACHINE_NOT_WORKING | MACHINE_NO_SOUND )
+// The clones only preset the LAYOUT machine configuration, so the
+// national keyboard can be picked from the command line:
+//   mamewang wltcit   (italiana)      mamewang wltcde   (tedesca)
+#define rom_wltcit rom_wltc
+#define rom_wltcde rom_wltc
+
+//    YEAR  NAME    PARENT  COMPAT  MACHINE  INPUT   CLASS       INIT        COMPANY              FULLNAME                                    FLAGS
+COMP( 1987, wltc,   0,      0,      wltc,    wltc,   wltc_state, empty_init, "Wang Laboratories", "Wang LapTop Computer",                      MACHINE_NOT_WORKING | MACHINE_NO_SOUND )
+COMP( 1987, wltcit, wltc,   0,      wltc,    wltcit, wltc_state, empty_init, "Wang Laboratories", "Wang LapTop Computer (tastiera italiana)",  MACHINE_NOT_WORKING | MACHINE_NO_SOUND )
+COMP( 1987, wltcde, wltc,   0,      wltc,    wltcde, wltc_state, empty_init, "Wang Laboratories", "Wang LapTop Computer (deutsche Tastatur)",  MACHINE_NOT_WORKING | MACHINE_NO_SOUND )
