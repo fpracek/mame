@@ -1234,6 +1234,10 @@ private:
 
 	void pic_ir(int n, int state)
 	{
+		// any request delivered to the controller sets the master latch
+		// (bit 15 of the cause word), cleared by the 2c10 strobe
+		if (state && m_legacy_bios && m_pic_ready)
+			m_master_latch = true;
 		switch (n & 7)
 		{
 		case 0: m_pic->ir0_w(state); break;
@@ -2004,6 +2008,7 @@ private:
 	uint8_t m_test_2f00 = 0;
 	uint8_t m_test_2c04 = 0;
 	bool m_kb_req_level = false;
+	bool m_master_latch = false;
 };
 
 
@@ -2438,7 +2443,38 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	}
 
 	if ((offset << 1) == 0x2b0a)
+	{
+		// The interrupt-cause word, one bit per source - the layout comes
+		// straight out of WLTCDIAG's quiescence table (each row names the
+		// bits its source must leave clear after its acknowledge):
+		//   bit 15 = test-interrupt generator (2f00 bit 7)
+		//   bit  7 = counter 1 latch (ack 2c16)     bit 6 = counter 2 (2c14)
+		//   bit  5 = DMA terminal count (ack 2c12)  bit 4 = SCC (read 2b00)
+		//   bit  3 = console latch (strobe 2c1e)    bit 2 = 5380 interrupt
+		//   bit  0 = RTC interrupt (flags & enables), bits 11-13 = serial
+		// The old constant 0xc7db (bits 0/3/4/6/7/15 permanently high) was
+		// why the suite failed its very first row with "Status Error -
+		// Timer 0 Test". The fixed-vector path keeps the constant that
+		// carried the whole boot bring-up.
+		if (m_legacy_bios && m_pic_ready)
+		{
+			// no fixed bits: WLTCDIAG's positive test compares the WHOLE
+			// word for equality (0x8080 = master + counter 1, exactly)
+			uint16_t v = 0x0000;
+			if (m_master_latch) v |= 0x8000;
+			if ((m_rtc[0x0c] & m_rtc[0x0b] & 0x70) != 0) v |= 0x0001;
+			if (m_scsi_rst_irq || m_scsi_irq) v |= 0x0004;
+			// bit 3 is the console REQUEST LEVEL (either status bit up),
+			// not the latch: the loaded system's services read this word
+			// to decide whether the console needs processing
+			if (m_kb_status & 0x03) v |= 0x0008;
+			if (m_dma_tc) v |= 0x0020;
+			if (BIT(m_source_state, 1)) v |= 0x0040;
+			if (BIT(m_source_state, 0)) v |= 0x0080;
+			return v;
+		}
 		return 0xc7db | ((m_scsi_rst_irq || m_scsi_irq) ? 0x0004 : 0) | (m_dma_tc ? 0x0020 : 0);
+	}
 
 	// Console status, read by the timer-tick device poller at E11C5 as
 	// port (selector << 8) | 0x62 with the console's selector 0x10. The
@@ -2858,6 +2894,25 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		// the poll is deliberately untouched, see there.
 		if ((offset << 1) == 0x2c1e || (offset << 1) == 0x2c10)
 			{ pic_ir(2, 0); m_source_state &= ~4; }
+		// 2c12 is the SCSI/DMA group's acknowledge: WLTCDIAG's recipe for
+		// that source ends with it and then requires the terminal-count
+		// bit of 2b0a clear, and the loaded system's service writes the
+		// 2b0a value it handled back to it
+		if ((offset << 1) == 0x2c12 || (offset << 1) == 0x2c10)
+		{
+			m_dma_tc = false;
+			m_dma_done = false;
+			pic_ir(3, 0);
+			m_source_state &= ~8;
+		}
+		// Any 2c10 strobe takes down the master latch (bit 15 of 2b0a,
+		// "an interrupt has been delivered"): WLTCDIAG's source-7 recipe
+		// ends on it and demands the bit clear, and the positive test's
+		// acknowledge writes it with the cause byte it handled. The latch
+		// re-arms at the very next delivery - which is why every consumer
+		// that polls it as "Master Active" still finds it up.
+		if ((offset << 1) == 0x2c10)
+			m_master_latch = false;
 	}
 
 	// Test-interrupt generator. WLTCDIAG's INTERRUPT CONTROL test arms
@@ -3032,6 +3087,28 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		// vanished. The poll runs every 200us, which is thousands of
 		// instructions after the strobe - long enough for the wait loop
 		// to have seen the bit low and left.
+		if (m_legacy_bios && m_pic_ready)
+		{
+			// The strobe's VALUE is the protocol. 0xCD (transmit side) and
+			// 0xCC (receive side) are the active strobes the console
+			// handlers cycle on - they consume the current grant, re-arm
+			// the micro and get answered, which is what carries both the
+			// print pump and the keyboard reader. Any other value (0x00,
+			// whatever WLTCDIAG's register happens to hold) is a plain
+			// acknowledge: it consumes the grant and re-arms NOTHING,
+			// which is what lets the diagnostic's quiescence check find
+			// both status bits low a millisecond after its single strobe.
+			uint8_t const strobe = data & 0xff;
+			m_kb_status &= ~0x01;
+			if (strobe == 0xcd || strobe == 0xcc)
+			{
+				m_kb_ready_again = true;
+				m_kb_reply = 0xfa;
+				m_kb_timer->adjust(attotime::from_usec(200));
+			}
+			kb_req_sync();
+			return;
+		}
 		if (m_legacy_bios)
 		{
 			m_kb_status &= ~0x01;
