@@ -146,7 +146,15 @@ v20_device::v20_device(const machine_config &mconfig, const char *tag, device_t 
 
 
 v30_device::v30_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
-	: nec_common_device(mconfig, V30, tag, owner, clock, true, 6, 2, V30_TYPE, true)
+	// prefetch cost 1 clock per byte: the V30 fetches a word per bus
+	// cycle, and the per-byte accounting at 2 starved the queue on
+	// straight-line code that the real part executes at its databook
+	// numbers - the Wang LapTop's shipped diagnostic calibrates a
+	// 40-byte delay loop against a hardware counter and its windows
+	// only fit the instruction table with the fetches fully overlapped
+	// (measured 68.3 clocks per iteration against the table's 58
+	// before this change, 2949 counts against an expected 2500..2525)
+	: nec_common_device(mconfig, V30, tag, owner, clock, true, 6, 1, V30_TYPE, true)
 {
 }
 
