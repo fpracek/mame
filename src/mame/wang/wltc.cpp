@@ -981,6 +981,7 @@ protected:
 		m_kb_poll = timer_alloc(FUNC(wltc_state::kb_poll_cb), this);
 		m_dma_timer = timer_alloc(FUNC(wltc_state::dma_service_cb), this);
 		m_layout_timer = timer_alloc(FUNC(wltc_state::layout_cb), this);
+		m_refresh_timer = timer_alloc(FUNC(wltc_state::refresh_tick), this);
 	}
 	virtual void machine_reset() override ATTR_COLD;
 
@@ -1967,6 +1968,29 @@ private:
 	}
 	TIMER_CALLBACK_MEMBER(dma_service_cb) { dma_service(); }
 	emu_timer *m_dma_timer = nullptr;
+	// DRAM refresh tick, surfaced as a periodic interrupt on line 7 while
+	// 0x2f00 bit 4 is set. WLTCDIAG's REFRESH CONTROL test arms exactly
+	// that bit, hooks vector 0x87 and requires 10 or 11 services during a
+	// delay(0x54) window. The window is a busy-loop of 607.6us of CPU
+	// time, so every service stretches it by the ISR's own cost (~14.5us
+	// measured: a 57.87us period yielded 14 services where 10-11 were
+	// demanded). 607.6/(T - 14.5) in [10..11] puts the period at 70-75us:
+	// 200 cycles of the 2.7648MHz master clock, dead centre at 10.5.
+	// The divider free-runs - bit 4 only opens the gate. It has to: the
+	// third sub-test clears its counter and reads it back a handful of
+	// instructions later, retrying until a tick lands inside that window.
+	// A divider restarted by the arming write would put the first tick at
+	// a fixed phase and the retry loop would either always hit or always
+	// miss; only a free-running phase makes it converge.
+	// The handler neither EOIs nor strobes an acknowledge port, so the
+	// line has to drop on its own INTA (the 8259 runs auto-EOI here; a
+	// level-held request would storm).
+	TIMER_CALLBACK_MEMBER(refresh_tick)
+	{
+		if (m_legacy_bios && m_pic_ready && BIT(m_test_2f00, 4))
+			pic_ir(7, 1);
+	}
+	emu_timer *m_refresh_timer = nullptr;
 	void scc_drq_w(int state)
 	{
 		// /W//REQ is active low
@@ -2083,8 +2107,15 @@ private:
 			// diagnostic's positive rows read the cause word WHILE their
 			// handler is servicing the interrupt and require the source's
 			// bit still up (row 0 compares for exactly master+counter1).
-			// Latches drop only on their own acknowledges.
-			return m_pic->acknowledge();
+			// Latches drop only on their own acknowledges. Line 7 is the
+			// exception: the refresh tick has no acknowledge port at all,
+			// so its request drops on its own INTA - otherwise the next
+			// tick's edge would land on a line still high and be lost.
+			uint8_t const v = m_pic->acknowledge();
+			if (v == 0x87 && !BIT(m_test_2f00, 6)
+					&& !(BIT(m_test_2f00, 7) && BIT(m_test_2c04, 7)))
+				pic_ir(7, 0);
+			return v;
 		}
 		// Before ICW1 the 8259 cannot deliver anything (measured: asking
 		// MAME's device anyway returned 0xcd, whose IVT slot is still
@@ -2101,6 +2132,62 @@ private:
 	bool m_expect_icw2 = false;
 	uint8_t m_test_2f00 = 0;
 	uint8_t m_test_2c04 = 0;
+
+	// I/O emulation trap. With bit 3 of 0x2c04 set - the machine's
+	// normal running state, the resident system writes 0x08 there - any
+	// I/O access outside the gate array's own 0x2000-0x2fff window is
+	// swallowed and answered with an NMI: the gate array latches the
+	// cycle and the system's software emulator performs the semantics.
+	// This is how IBM PC software's port accesses (0x40 timer, 0x60
+	// keyboard, 0x3dx CGA...) reach anything real. WLTCDIAG's I/O
+	// EMULATION test walks 55 accesses and checks all three latches:
+	// - 0x2b04: descriptor - bit 4 write, bit 2 word cycle, bit 3
+	//   split word (odd address, two byte cycles), bits 0-1 always 11,
+	//   high byte = A12-A15 of the trapped address
+	// - 0x2b06: the data bus, latched lane by lane (an odd word lands
+	//   byte-swapped: low byte on D8-15 first, high byte on D0-7 after)
+	// - 0x2b08: A0-A11 of the last byte cycle (odd word: address + 1)
+	// A write to 0x2c18 releases the latch. The one exception measured:
+	// reading CGA status at 0x3da does NOT trap (the gate array answers
+	// that one itself - the POST calibrates against it), but writing it
+	// does.
+	uint8_t m_ctl_2c04 = 0;
+	uint16_t m_trap_desc = 0, m_trap_data = 0, m_trap_addr = 0;
+	bool m_trap_pending = false;
+	attotime m_trap_when = attotime::never;
+	bool io_trap(uint16_t port, uint16_t data, uint16_t mem_mask, bool wr)
+	{
+		if ((port & 0xf000) == 0x2000)
+			return false;
+		if (!wr && (port & 0xfffe) == 0x3da)
+			return false;
+		if (!BIT(m_ctl_2c04, 3))
+			return false;
+		if (machine().side_effects_disabled())
+			return false;
+		bool const merge = m_trap_pending && machine().time() == m_trap_when;
+		if (m_trap_pending && !merge)
+			return true; // latch busy: the cycle is still swallowed
+		bool const hi_only = (mem_mask & 0xff00) && !(mem_mask & 0x00ff);
+		bool const word = (mem_mask & 0xff00) && (mem_mask & 0x00ff);
+		uint16_t const addr = port | (hi_only ? 1 : 0);
+		uint8_t size = word ? 0x04 : 0x00;
+		if (merge)
+			size = 0x08; // second byte cycle of a split word
+		m_trap_desc = (wr ? 0x10 : 0x00) | size | 0x03 | ((addr & 0xf000) >> 4);
+		m_trap_addr = addr & 0x0fff;
+		if (mem_mask & 0x00ff)
+			m_trap_data = (m_trap_data & 0xff00) | (data & 0x00ff);
+		if (mem_mask & 0xff00)
+			m_trap_data = (m_trap_data & 0x00ff) | (data & 0xff00);
+		if (!merge)
+		{
+			m_trap_pending = true;
+			m_trap_when = machine().time();
+			m_maincpu->pulse_input_line(INPUT_LINE_NMI, attotime::zero);
+		}
+		return true;
+	}
 	bool m_kb_req_level = false;
 	bool m_kb_grant_silent = false;
 	attotime m_kb_ready_at = attotime::zero;
@@ -2405,6 +2492,19 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 {
 	if (!machine().side_effects_disabled())
 		logerror("%06x: io_r %04x mask %04x\n", m_maincpu->pc(), offset << 1, mem_mask);
+
+	// a trapped read is answered by nobody: open bus, and the software
+	// emulator supplies the real answer from inside the NMI handler
+	if (io_trap(offset << 1, 0xffff, mem_mask, false))
+		return 0xffff;
+
+	// I/O emulation trap latches (see io_trap)
+	if ((offset << 1) == 0x2b04)
+		return m_trap_desc;
+	if ((offset << 1) == 0x2b06)
+		return m_trap_data;
+	if ((offset << 1) == 0x2b08)
+		return m_trap_addr;
 
 	// D71054 programmable interval timer (8254 clone) at 0x2400-0x2406,
 	// one register every other address: the diagnostic utility programs
@@ -2765,6 +2865,17 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 {
 	logerror("%06x: io_w %04x = %04x mask %04x\n", m_maincpu->pc(), offset << 1, data, mem_mask);
 
+	if (io_trap(offset << 1, data, mem_mask, true))
+		return;
+
+	if ((offset << 1) == 0x2c04 && ACCESSING_BITS_0_7)
+		m_ctl_2c04 = data & 0xff;
+	if ((offset << 1) == 0x2c18)
+	{
+		m_trap_pending = false;
+		return;
+	}
+
 	// At the first write to 0x2d00 - the first I/O the phase-B init
 	// issues once the cold start has copied itself into shadow RAM - the
 	// low-memory overlay switches from the EPROM base (which the copy
@@ -3055,6 +3166,12 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 				pic_ir(7, 0);
 			}
 		}
+		// Bit 4 on its own opens the free-running refresh tick onto
+		// line 7 (see refresh_tick). Closing the gate takes an
+		// undelivered tick off the line with it.
+		if (!BIT(data, 4) && BIT(prima, 4)
+				&& !BIT(m_test_2f00, 6) && m_legacy_bios && m_pic_ready)
+			pic_ir(7, 0);
 	}
 	if ((offset << 1) == 0x2c04 && ACCESSING_BITS_0_7
 			&& m_legacy_bios && m_pic_ready && BIT(m_test_2f00, 7))
@@ -3331,6 +3448,8 @@ void wltc_state::machine_reset()
 	// the micro announces itself ready a few hundred microseconds after
 	// each exchange, which is what raises the vector 0x22 interrupt
 	m_kb_poll->adjust(attotime::from_usec(200), 0, attotime::from_usec(200));
+	// free-running refresh divider (see refresh_tick for the period)
+	m_refresh_timer->adjust(attotime::from_ticks(200, 2'764'800), 0, attotime::from_ticks(200, 2'764'800));
 	if (!m_vram)
 		m_vram = std::make_unique<uint8_t[]>(0x20000);
 	std::fill_n(&m_vram[0], 0x20000, 0);
