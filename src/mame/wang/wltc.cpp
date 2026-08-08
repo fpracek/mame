@@ -1117,6 +1117,8 @@ private:
 	// signature; the BIOS's own vector-0x84 service reads 0x2b00 too).
 	void scc_int_w(int state)
 	{
+		logerror("SCC INT -> %d (cause=%d)\n", state, m_scc_cause);
+		m_scc_int_line = bool(state);
 		if (!m_legacy_bios)
 		{
 			m_pic->ir3_w(state);
@@ -1130,6 +1132,7 @@ private:
 		}
 	}
 	bool m_scc_cause = false;
+	bool m_scc_int_line = false;
 	void scsi_int_w(int state)
 	{
 		m_scsi_irq = bool(state);
@@ -2808,14 +2811,34 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	case 0x2b00:
 		// serial (SCC) cause register: reading it is the source-4
 		// acknowledge - the latched request and bit 4 of the cause word
-		// drop here. The BIOS's vector-0x84 service reads it and hands
-		// the value (shifted right once) to the registered device hook.
+		// drop here - AND the gate array's INTACK cycle to the SCC. The
+		// read fetches the modified vector (the BIOS's vector-0x84
+		// service hands it, shifted right once, to the registered device
+		// hook), sets the chip's IUS bit and DROPS the shared INT line.
+		// The service's closing Reset Highest IUS (WR0 = 0x38, written
+		// through either channel - the command is chip-wide) re-asserts
+		// INT if more conditions pend, and that edge re-latches the
+		// request. Without the handshake the line never dropped between
+		// the transmit interrupt and the looped-back receive character,
+		// and the edge-only latch lost the second one for good - the
+		// DMA CONTROL failure.
 		if (m_legacy_bios && m_pic_ready && !machine().side_effects_disabled())
 		{
 			m_scc_cause = false;
 			pic_ir(4, 0);
 			m_source_state &= ~0x10;
+			if (m_scc_int_line)
+				return m_scc->m1_r() & 0xff;
 		}
+		return 0x0000;
+	case 0x2b0c:
+		// gate-array serial status. The system's serial driver folds
+		// two of its bits into the channel status it keeps per device
+		// (E000:5cfb: read, shl, and 0x90 - bits 6 and 3 land in status
+		// bits 7 and 4, the Break/Abort and line-state positions). Open
+		// bus read as 0xff kept both permanently raised and the DMA
+		// CONTROL smoke test saw a dead line. Nothing is attached, so
+		// the bits idle low.
 		return 0x0000;
 	case 0x2b02:
 		// keyboard/console channel status: bit 0 ready to accept a
@@ -3450,6 +3473,14 @@ void wltc_state::machine_reset()
 	m_kb_poll->adjust(attotime::from_usec(200), 0, attotime::from_usec(200));
 	// free-running refresh divider (see refresh_tick for the period)
 	m_refresh_timer->adjust(attotime::from_ticks(200, 2'764'800), 0, attotime::from_ticks(200, 2'764'800));
+	// the serial driver watches the modem lines: its interrupt hook
+	// reads RR0 and marks the line dead when CTS is away (E5F5:0157,
+	// test al,0x20), and the activation step refuses a dead line. On
+	// the machine nothing drives them, so they idle asserted.
+	m_scc->ctsa_w(0);
+	m_scc->ctsb_w(0);
+	m_scc->dcda_w(0);
+	m_scc->dcdb_w(0);
 	if (!m_vram)
 		m_vram = std::make_unique<uint8_t[]>(0x20000);
 	std::fill_n(&m_vram[0], 0x20000, 0);
