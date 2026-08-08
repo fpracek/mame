@@ -2003,6 +2003,7 @@ private:
 	}
 	bool m_scc_drq = false;
 	uint8_t m_dma_dev = 1;
+	uint8_t m_dma_tc_chan = 0;
 	void dma_service()
 	{
 		address_space &space = m_maincpu->space(AS_PROGRAM);
@@ -2041,6 +2042,8 @@ private:
 	{
 		m_dma_go = false;
 		m_dma_tc = true;
+		// remember which channel finished, for the 0x230b status read
+		m_dma_tc_chan |= 1 << (m_dma_dev & 7);
 		if (m_dma_floppy)
 		{
 			// terminal count goes out after the last byte and stays out
@@ -2732,10 +2735,25 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		case 0x2304: return m_dma_addr & 0xffff;
 		case 0x2306: return (m_dma_addr >> 16) & 0x0f;
 		case 0x230a:
-			// reading 0x230b acknowledges the terminal count - the ISR
-			// does it on the way out, after re-masking the channel
-			if (ACCESSING_BITS_8_15 && !machine().side_effects_disabled())
-				m_dma_tc = false;
+			// 0x230b is the terminal-count status, one bit per channel in
+			// the numbering 0x2301 uses. The loaded system's line-3
+			// handler acknowledges on 0x2c12 and then reads this one,
+			// notifying the device registered on every channel whose bit
+			// is up - 0x18 for channel 1, 0x19 for channel 2 and so on
+			// (E000:041F). That is how a transfer's completion reaches
+			// whoever asked for it, and answering with an empty register
+			// is what left WLTCDIAG's DMA CONTROL waiting for a
+			// completion that had already happened. Reading acknowledges.
+			if (ACCESSING_BITS_8_15)
+			{
+				uint16_t const v = m_dma_reg[0x0a] | (m_dma_tc_chan << 8);
+				if (!machine().side_effects_disabled())
+				{
+					m_dma_tc = false;
+					m_dma_tc_chan = 0;
+				}
+				return v;
+			}
 			break;
 		}
 		int const reg = (offset << 1) - 0x2300;

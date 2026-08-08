@@ -554,6 +554,17 @@ that pulls IEO Low. This selectively deactivates parts of the daisy chain regard
 
 */
 
+// m_int_state is indexed to match the RR3 bit layout, which runs
+// external/status, transmit, receive within a channel. The chip serves
+// them in the opposite order - receive first - and channel A before
+// channel B, so anything that means "the highest priority one" has to
+// walk the array in this order instead of its own. Taking the array
+// order let a transmit interrupt preempt a receive one for ever: the
+// Wang LapTop diagnostic's loopback lost every other character, its
+// handler being handed the transmit vector over and over while the
+// received one sat in the FIFO until it overflowed.
+static constexpr int INT_PRIORITY[6] = { 2, 1, 0, 5, 4, 3 };
+
 //-------------------------------------------------
 //  z80daisy_irq_state - get interrupt status
 //-------------------------------------------------
@@ -565,9 +576,10 @@ int z80scc_device::z80daisy_irq_state()
 			m_int_state[0], m_int_state[1], m_int_state[2],
 			m_int_state[3], m_int_state[4], m_int_state[5]);
 
-	// loop over all interrupt sources
-	for (auto & elem : m_int_state)
+	// loop over all interrupt sources, highest priority first
+	for (int prio : INT_PRIORITY)
 	{
+		int const elem = m_int_state[prio];
 		// if we're servicing a request, don't indicate more interrupts
 		if (elem & Z80_DAISY_IEO)
 		{
@@ -594,15 +606,26 @@ int z80scc_device::z80daisy_irq_ack()
 	int ret = -1; // Indicate default vector
 
 	LOGINT("%s\n", FUNCNAME);
-	// loop over all interrupt sources
-	for (auto & elem : m_int_state)
+	// loop over all interrupt sources, highest priority first
+	for (int prio : INT_PRIORITY)
 	{
+		int &elem = m_int_state[prio];
 		// find the first channel with an interrupt requested
 		if (elem & Z80_DAISY_INT)
 		{
 			elem = Z80_DAISY_IEO; // Set IUS bit (called IEO in z80 daisy lingo)
 			check_interrupts();
 			LOGINT(" - Found an INT request, ");
+			// The acknowledge cycle returns the vector of the interrupt
+			// being acknowledged - this source - and not whichever one
+			// happened to trigger last, which is all m_rr2 held. Status
+			// goes in only with Vector Includes Status set, exactly as
+			// the RR2 read through channel B builds it.
+			if (m_wr9 & WR9_BIT_VIS)
+				m_chanB->m_rr2 = modify_vector(m_chanA->m_wr2,
+						(prio < 3) ? CHANNEL_A : CHANNEL_B, m_int_source[prio] & 3);
+			else
+				m_chanB->m_rr2 = m_chanA->m_wr2;
 			if (m_wr9 & WR9_BIT_NV)
 			{
 				LOGINT("but WR9 D1 set to use autovector, returning the default vector\n");
@@ -1477,12 +1500,14 @@ uint8_t z80scc_channel::do_sccreg_rr2()
 		int i = 0;
 
 		LOGINT(" - Channel B so we might need to update the vector modification\n");
-		// loop over all interrupt sources
-		for (auto & elem : m_uart->m_int_state)
+		// loop over all interrupt sources, highest priority first
+		for (int prio : INT_PRIORITY)
 		{
+			int &elem = m_uart->m_int_state[prio];
 			// find the first channel with an interrupt requested
 			if (elem & Z80_DAISY_INT)
 			{
+				i = prio;
 				LOGINT(" - Checking an INT source %d\n", i);
 				m_rr2 = m_uart->modify_vector(m_rr2, i < 3 ? z80scc_device::CHANNEL_A : z80scc_device::CHANNEL_B, m_uart->m_int_source[i] & 3);
 				if ((m_uart->m_variant & (z80scc_device::SET_ESCC | z80scc_device::SET_CMOS)) && (m_uart->m_wr9 & WR9_BIT_IACK))
@@ -1493,7 +1518,6 @@ uint8_t z80scc_channel::do_sccreg_rr2()
 				}
 				break;
 			}
-			i++;
 		}
 	}
 	return m_rr2;
@@ -1785,9 +1809,10 @@ void z80scc_channel::do_sccreg_wr0(uint8_t data)
 		   daisy chain (even in systems without an external daisy chain) and is the last operation in
 		   an interrupt service routine. */
 		LOGCMD("Reset Highest IUS\n");
-		// loop over all interrupt sources
-		for (auto & elem : m_uart->m_int_state)
+		// loop over all interrupt sources, highest priority first
+		for (int prio : INT_PRIORITY)
 		{
+			int &elem = m_uart->m_int_state[prio];
 			// find the first interrupt under service
 			if (elem & Z80_DAISY_IEO)
 			{
@@ -2479,7 +2504,14 @@ void z80scc_channel::data_write(uint8_t data)
 			m_rr0 &= ~RR0_TX_BUFFER_EMPTY; // If only one FIFO position it is full now!
 
 			LOGINT("Single-slot TX FIFO no longer empty, clearing TBE interrupt\n");
-			m_tx_int_disarm = 1;
+			// Writing data only takes the pending interrupt away. It must
+			// not disarm the next one: the buffer emptying again - when
+			// this byte moves into the shift register - is exactly the
+			// event the chip interrupts on, and suppressing it left the
+			// transmitter idle for a whole character every other byte
+			// (measured on the Wang LapTop diagnostic's loopback: 1.93ms
+			// a character where the 9600 baud frame is 1.15ms). Only the
+			// Reset Tx Int Pending command disarms.
 			m_uart->m_int_state[INT_TRANSMIT_PRIO + (m_index == z80scc_device::CHANNEL_A ? 0 : 3 )] = 0;
 			// Based on the fact that prio levels are aligned with the bitorder of rr3 we can do this...
 			m_uart->m_chanA->m_rr3 &= ~(1 << (INT_TRANSMIT_PRIO + ((m_index == z80scc_device::CHANNEL_A) ? 3 : 0)));
@@ -2492,7 +2524,7 @@ void z80scc_channel::data_write(uint8_t data)
 			m_rr0 &= ~RR0_TX_BUFFER_EMPTY; // Indicate that the TX fifo is full
 
 			LOGINT("Multi-slot TX FIFO no longer empty, clearing TBE interrupt\n");
-			m_tx_int_disarm = 1;
+			// see the single-slot branch above
 			m_uart->m_int_state[INT_TRANSMIT_PRIO + (m_index == z80scc_device::CHANNEL_A ? 0 : 3 )] = 0;
 			// Based on the fact that prio levels are aligned with the bitorder of rr3 we can do this...
 			m_uart->m_chanA->m_rr3 &= ~(1 << (INT_TRANSMIT_PRIO + ((m_index == z80scc_device::CHANNEL_A) ? 3 : 0)));
