@@ -3989,10 +3989,13 @@ static INPUT_PORTS_START( wltc )
 	PORT_CONFSETTING(      0x0002, "run the table as code" )
 	PORT_CONFSETTING(      0x0004, "enter the body with CS=E35F" )
 	// experimental: hand the 1986 firmware's interrupts to the real 8259
-	// at the base-0x80 programming. Off by default (the fixed-vector path
-	// boots); on, it clears the counter-0 flood but a counter-2 storm
-	// remains - see NOTE-RICOGNIZIONE.
-	PORT_CONFNAME( 0x0008, 0x0000, "8259 handover (sperimentale)" )
+	// at the base-0x80 programming. On by default since the full battery
+	// went green on it - sysmode boots 77.0s against the fixed-vector
+	// path's 81.0s, BASIC+CGA 25.9s, and the WLTCDIAG CPU suite runs
+	// INTERRUPT CONTROL, PROGRAMMABLE TIMER, REFRESH CONTROL and I/O
+	// EMULATION clean. The fixed-vector path stays selectable as the
+	// fallback.
+	PORT_CONFNAME( 0x0008, 0x0008, "8259 handover" )
 	PORT_CONFSETTING(      0x0000, "off (percorso a vettore fisso)" )
 	PORT_CONFSETTING(      0x0008, "on (base 0x80)" )
 
