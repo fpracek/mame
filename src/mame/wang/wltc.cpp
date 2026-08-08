@@ -3909,8 +3909,19 @@ void wltc_state::wltc(machine_config &config)
 	// on attempt nine, both inside the window; 3.072 MHz leaves
 	// counter 1 one attempt early.
 	m_pit->set_clk<0>(2'764'800);
+	// WLTCDIAG's PROGRAMMABLE TIMER test is a two-constraint oracle on
+	// the CPU-to-counter ratio: the count delta across its calibrated
+	// 500-iteration delay must land in [2500..2525], and a 19400-
+	// iteration delay must contain exactly ten timer periods. Both come
+	// out EXACT on the real machine with these counters at 1 MHz and
+	// the V30 running the delay body (nine or-reg-imm, three nops, a
+	// loop) in its databook 40 clocks: 2.5 ms and ten 10 ms ticks. No
+	// single clock trim satisfies both under MAME's NEC core, whose
+	// cycle counts for that mix run long - the fix belongs in the CPU
+	// core's timing, not here. Until then the counters stay on the
+	// POST-calibrated 691.2 kHz that carries everything else.
 	m_pit->set_clk<1>(2'764'800 / 4);
-	m_pit->set_clk<2>(2'764'800 / 4);   // tested identically to counter 1
+	m_pit->set_clk<2>(2'764'800 / 4);
 
 	// The IBM alias at 0x40-0x43 (Industry Standard side of the gate
 	// array): a timer of its own at the PC's clock, free-running for
