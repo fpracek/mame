@@ -1108,6 +1108,27 @@ private:
 	// interrupt on purpose and reads the real phase in the handler. With
 	// the line going nowhere it waits forever with its busy flag set,
 	// which is where INT 88h function 0x27 was hanging.
+	// The SCC's interrupt line. On the 4.02.03 family it rides the
+	// controller's ir3 as it always did; in the 1986 gate-array scheme it
+	// is source 4 - bit 4 of the cause word - latched on the rising edge
+	// and acknowledged by reading 0x2b00 (WLTCDIAG's row 4 programs the
+	// channel A local loopback, sends 0x55 and expects exactly that
+	// signature; the BIOS's own vector-0x84 service reads 0x2b00 too).
+	void scc_int_w(int state)
+	{
+		if (!m_legacy_bios)
+		{
+			m_pic->ir3_w(state);
+			return;
+		}
+		if (m_pic_ready && state && !m_scc_cause)
+		{
+			m_scc_cause = true;
+			pic_ir(4, 1);
+			m_source_state |= 0x10;
+		}
+	}
+	bool m_scc_cause = false;
 	void scsi_int_w(int state)
 	{
 		m_scsi_irq = bool(state);
@@ -1696,11 +1717,21 @@ private:
 			m_kb_replies.push_back(0x01);
 			m_kb_replies.push_back(0x00);
 		}
-		// taking the byte makes the micro busy, and ready again a moment
+		// the beeper CLICK is acknowledged with a response byte - row 3
+		// of WLTCDIAG's INTERRUPT CONTROL sends 0x0c and requires the
+		// byte-waiting interrupt with 2b02 == 0x02, and its acknowledge
+		// consumes the byte without checking its value. The TONE (0x0b)
+		// answers with the transmit-ready cycle alone - row 2 requires
+		// 2b02 == 0x01 exactly, so no byte there.
+		if (cmd == 0x0c)
+			m_kb_replies.push_back(0x00);
+		// Taking the byte makes the micro busy, and ready again a moment
 		// later - that re-arming is what carries the test from one byte
-		// to the next
+		// to the next. A command answered with a RESPONSE BYTE does not
+		// re-arm: the response is the whole answer (WLTCDIAG row 4 fails
+		// on a spurious console edge if the click's ready comes back).
 		m_kb_status &= ~0x01;
-		m_kb_ready_again = true;
+		m_kb_ready_again = (cmd != 0x0c && cmd != 0x1e);
 	}
 	TIMER_CALLBACK_MEMBER(kb_poll_cb)
 	{
@@ -2469,6 +2500,7 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 			// to decide whether the console needs processing
 			if (m_kb_status & 0x03) v |= 0x0008;
 			if (m_dma_tc) v |= 0x0020;
+			if (m_scc_cause) v |= 0x0010;
 			if (BIT(m_source_state, 1)) v |= 0x0040;
 			if (BIT(m_source_state, 0)) v |= 0x0080;
 			return v;
@@ -2605,6 +2637,18 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 			return m_kb_rx;
 		}
 		return 0x0044; // handshake status, bit7 = busy, measured idle
+	case 0x2b00:
+		// serial (SCC) cause register: reading it is the source-4
+		// acknowledge - the latched request and bit 4 of the cause word
+		// drop here. The BIOS's vector-0x84 service reads it and hands
+		// the value (shifted right once) to the registered device hook.
+		if (m_legacy_bios && m_pic_ready && !machine().side_effects_disabled())
+		{
+			m_scc_cause = false;
+			pic_ir(4, 0);
+			m_source_state &= ~0x10;
+		}
+		return 0x0000;
 	case 0x2b02:
 		// keyboard/console channel status: bit 0 ready to accept a
 		// byte, bit 1 a byte waiting to be read.
@@ -3913,7 +3957,7 @@ void wltc_state::wltc(machine_config &config)
 	// shift register when the loop ran out.
 	SCC8530(config, m_scc, 4'915'200);
 	m_scc->configure_channels(4'915'200 / 32, 4'915'200 / 32, 4'915'200 / 32, 4'915'200 / 32);
-	m_scc->out_int_callback().set(m_pic, FUNC(pic8259_device::ir3_w));
+	m_scc->out_int_callback().set(FUNC(wltc_state::scc_int_w));
 
 	// 8250-compatible UART at 0x3f8, with the usual 1.8432 MHz clock
 	INS8250(config, m_uart, 1'843'200);
