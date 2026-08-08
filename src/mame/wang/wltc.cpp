@@ -1262,7 +1262,18 @@ private:
 		// used to separate.
 		if (m_pic_ready)
 		{
-			if (n < 2)
+			// Sources 0-3 are edge-latched in the gate array and cleared
+			// by their acknowledge ports (2c16, 2c14, 2c1e/2c10, 2c12 -
+			// see the io write handler), NOT by the request falling. This
+			// matters most for line 3: the 5380's interrupt idles HIGH by
+			// design (the disk service arms the phase mismatch on purpose)
+			// and the firmware's services open the whole mask (2202=0)
+			// momentarily on their way out - with a level that window
+			// re-delivered the parasite every time (measured: 18111 line-3
+			// services against 125 in the fixed-vector run, and the boot
+			// crawled at timeout speed). The 2c12 writes the service does
+			// with the 2b0a value it handled are the hardware latch clear.
+			if (n < 4)
 			{
 				if (state && !was) pic_ir(n, 1);
 			}
@@ -1725,9 +1736,18 @@ private:
 		}
 		if (m_pic_ready)
 		{
-			// the request is the byte waiting to be read: bit 0, ready to
-			// accept, never clears and so cannot hold a level
-			set_source(2, (m_kb_status & 0x02) != 0);
+			// Both status bits raise the request, exactly as in the gate
+			// array scheme: the loaded system's console pump LIVES on the
+			// transmit-ready interrupt (bit 0) - that is what makes its
+			// service send the next command out of 0x2c1e. Bit 0 being
+			// high most of the time does not flood a level-triggered
+			// controller here, because the firmware itself masks bit 2 of
+			// 0x2202 on the way out of the service and opens it again only
+			// when it has something to say (measured: its ISR ends with
+			// 2202=4). Exposing only bit 1 starved the pump - 129k console
+			// acknowledges in the working run against zero after the
+			// handover, no console output, no menu.
+			set_source(2, (m_kb_status & 0x03) != 0);
 		}
 		else if ((m_kb_status & 0x03) && !BIT(m_int_enable_2202, 2))
 		{
@@ -1758,16 +1778,16 @@ private:
 		// while this driver's own shadow said no line was up.
 		if (N == 0)
 		{
-			// Counter 0 still reaches the controller's ir0 as it always did.
-			// Straight to ir0 for the 4.02.03 firmware and for the 1986
-			// POST before the handover. After the handover the counter is
-			// a level that is high half the time, and a level-triggered
-			// controller would re-fire on it for ever: route it through
-			// set_source, which latches only the rising edge for the two
-			// counters and drops it on the gate array's own EOI port.
-			if (m_legacy_bios && m_pic_ready)
-				set_source(0, state != 0);
-			else
+			// Counter 0 still reaches the controller's ir0 as it always did
+			// for the 4.02.03 firmware, whose scheme is the PC-like one. In
+			// the 1986 gate-array scheme counter 0 is NOT an interrupt
+			// source at all - source 0 is counter 1, source 1 is counter 2 -
+			// so once the handover puts the controller in charge it must
+			// stop driving ir0. Measured with it still routed there: its
+			// ~7 kHz output flooded vector 0x80 - the tick handler EOIed
+			// correctly (2c16 then OCW2 0xE0), but five thousand interrupts
+			// a second ground the machine to a crawl in its delay loops.
+			if (!(m_legacy_bios && m_pic_ready))
 				m_pic->ir0_w(state);
 			return;
 		}
@@ -1953,6 +1973,8 @@ private:
 	}
 	bool m_pic_inited = false;
 	bool m_expect_icw2 = false;
+	uint8_t m_test_2f00 = 0;
+	uint8_t m_test_2c04 = 0;
 };
 
 
@@ -2371,11 +2393,19 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	// at F1244 ever tests). It has to be an event flag, not the constant
 	// it used to be here, or every SCSI interrupt would also report a
 	// completed transfer.
-	if ((offset << 1) == 0x2b0a && m_pic_ready && m_dma_done
+	if ((offset << 1) == 0x2b0a && m_pic_ready
 			&& !machine().side_effects_disabled())
 	{
 		m_dma_done = false;
-		update_line3();
+		// reading the cause register is the line-3 acknowledge: the
+		// latched request drops here and stays down - even though the
+		// 5380's own interrupt line idles high with the phase mismatch
+		// armed - until the next event edge latches it again. Both
+		// generations of handler read this register in every service;
+		// only the later one also writes 2c12, so the write cannot be
+		// the acknowledge.
+		pic_ir(3, 0);
+		m_source_state &= ~8;
 	}
 
 	if ((offset << 1) == 0x2b0a)
@@ -2535,6 +2565,16 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		// controller's own interrupt line.
 		if (m_legacy_bios)
 		{
+			// reading the cause register is the console acknowledge - the
+			// same read-to-clear the SCSI/DMA group has on 0x2b0a; the
+			// periodic poll re-latches while a status bit is still up, so
+			// the delivery rate is the poll rate, exactly what the
+			// pulse-based fixed-vector scheme gave the firmware
+			if (m_pic_ready && !machine().side_effects_disabled())
+			{
+				pic_ir(2, 0);
+				m_source_state &= ~4;
+			}
 			floppy_image_device *const f = m_floppy->get_device();
 			return 0xc4
 					| ((f && f->exists()) ? 0 : 0x08)
@@ -2753,31 +2793,68 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		if ((offset << 1) == 0x2202 && m_expect_icw2)
 		{
 			m_expect_icw2 = false;
-			// Gated behind a configuration switch while the handover is
-			// still being brought up: the default keeps the proven
-			// fixed-vector path that boots. With the switch on, the
-			// base-0x80 trigger clears the counter-0 flood that killed
-			// every earlier attempt at ICW1 (its tick handler at E0119
-			// does write the 2c16 EOI); what remains is a counter-2 /
-			// vector 0x81 storm in the loaded system's handlers at
-			// F000:Cxxx, which slows the machine to a crawl.
+			// Gated behind a configuration switch while the handover
+			// finishes maturing: the default keeps the proven fixed-vector
+			// path. With the switch on the machine now runs COMPLETELY on
+			// the 8259 - boot, menu, DOS, keyboard, all video modes, at
+			// full speed (the whole sysmode regression passes) - thanks to
+			// three findings: hand over at the base-0x80 programming (at
+			// ICW1/base 0x20 the tick handler that writes the 2c16 EOI is
+			// not installed yet and counter 0 floods vector 0x20), stop
+			// counter 0 from driving ir0 (not a source in this scheme),
+			// and treat sources 0-3 as edge-latched with their own
+			// acknowledges (2c16/2c14 writes, 2b02/2b0a reads). Still
+			// open: WLTCDIAG's INTERRUPT CONTROL test generator - see the
+			// 2f00/2c04 model - whose forced requests reach the BIOS
+			// services but not yet the event codes (0x10/0x11) the
+			// diagnostic registers for.
 			if (m_legacy_bios && !m_pic_ready && (data & 0xff) == 0x80
 					&& BIT(ioport("CONFIG")->read(), 3))
 			{
 				m_pic_ready = true;
+				// counter 0 stops driving ir0 from here on (it is not a
+				// source in this scheme) - clear whatever it left there
+				m_pic->ir0_w(0);
 				logerror("8259 handover (base 0x80) a %s\n",
 						machine().time().as_string(6));
 			}
 		}
 	}
 
-	// the gate array's end-of-interrupt ports for the two counters
+	// The gate array's end-of-interrupt ports for the two counters. The
+	// counters have no cause register to read, so their latch clears are
+	// these writes; the console and the SCSI/DMA group clear on the READ
+	// of their cause registers instead - 0x2b02 and 0x2b0a, see io_r.
 	if (m_legacy_bios && m_pic_ready && ACCESSING_BITS_0_7)
 	{
 		if ((offset << 1) == 0x2c16 || (offset << 1) == 0x2c10)
 			{ pic_ir(0, 0); m_source_state &= ~1; }
 		if ((offset << 1) == 0x2c14 || (offset << 1) == 0x2c10)
 			{ pic_ir(1, 0); m_source_state &= ~2; }
+	}
+
+	// Test-interrupt generator. WLTCDIAG's INTERRUPT CONTROL test arms
+	// bit 7 of 0x2f00, installs its own handlers on vectors 0x80-0x87,
+	// and then writes a bit mask to 0x2c04: each set bit forces that
+	// source's request up (its handlers mask themselves off in OCW1 and
+	// answer with specific EOIs - no gate-array acknowledge - so the
+	// forced request must follow the register, released when the test
+	// writes 0 on the way out). The 1986 BIOS init writes 0x80 then 0x00
+	// to 0x2f00, which is the same generator being parked after the POST.
+	if ((offset << 1) == 0x2f00 && ACCESSING_BITS_0_7)
+		m_test_2f00 = data & 0xff;
+	if ((offset << 1) == 0x2c04 && ACCESSING_BITS_0_7
+			&& m_legacy_bios && m_pic_ready && BIT(m_test_2f00, 7))
+	{
+		uint8_t const nuovo = data & 0xff;
+		for (int n = 0; n < 8; n++)
+		{
+			bool const su = BIT(nuovo, n), era = BIT(m_test_2c04, n);
+			if (su && !era) { pic_ir(n, 1); m_source_state |= 1 << n; }
+			if (!su && era) { pic_ir(n, 0); m_source_state &= ~(1 << n); }
+		}
+		m_test_2c04 = nuovo;
+		logerror("test-int 2c04 = %02x (2f00=%02x)\n", nuovo, m_test_2f00);
 	}
 
 	if ((offset << 1) == 0x2202)
