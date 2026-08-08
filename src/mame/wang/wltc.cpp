@@ -1726,12 +1726,20 @@ private:
 		if (cmd == 0x0c)
 			m_kb_replies.push_back(0x00);
 		// Taking the byte makes the micro busy, and ready again a moment
-		// later - that re-arming is what carries the test from one byte
-		// to the next. A command answered with a RESPONSE BYTE does not
-		// re-arm: the response is the whole answer (WLTCDIAG row 4 fails
-		// on a spurious console edge if the click's ready comes back).
+		// later - the FAST grant, which is the transmit-done interrupt
+		// event that carries the pump from one byte to the next. It is
+		// delivered by the poll AFTER the writing service has closed, so
+		// the service's own acknowledge strobe cannot eat it. A command
+		// answered with a RESPONSE BYTE does not re-arm: the response is
+		// the whole answer (WLTCDIAG row 4 fails on a spurious console
+		// edge if the click's ready comes back).
 		m_kb_status &= ~0x01;
 		m_kb_ready_again = (cmd != 0x0c && cmd != 0x1e);
+		if (m_kb_ready_again)
+		{
+			m_kb_grant_silent = false;
+			m_kb_ready_at = attotime::zero;
+		}
 	}
 	TIMER_CALLBACK_MEMBER(kb_poll_cb)
 	{
@@ -1763,11 +1771,28 @@ private:
 			uint8_t const scan = WANG2IBM[m_kb_rx & 0x7f];
 			if (scan != 0x00 && scan != 0xff)
 				m_port60 = scan | (m_kb_rx & 0x80);
+			// a received byte is an interrupt event in its own right,
+			// whatever the transmit-ready level: a keypress must
+			// interrupt even while ready idles high
+			if (m_pic_ready)
+			{
+				pic_ir(2, 1);
+				m_source_state |= 4;
+			}
 		}
-		else if (!(m_kb_status & 0x03) && m_kb_ready_again)
+		else if (!(m_kb_status & 0x03) && m_kb_ready_again
+				&& machine().time() >= m_kb_ready_at)
 		{
 			m_kb_status |= 0x01;
 			m_kb_ready_again = false;
+			// the FAST grant is the transmit-done event and interrupts;
+			// the slow silent restore after a bare strobe is pure status
+			if (m_pic_ready && !m_kb_grant_silent)
+			{
+				pic_ir(2, 1);
+				m_source_state |= 4;
+			}
+			m_kb_req_level = true;
 		}
 		if (m_pic_ready)
 		{
@@ -2054,6 +2079,11 @@ private:
 		{
 			if (!m_pic_ready)
 				return m_gate_vector;
+			// The delivery does NOT clear the gate-array latch: the
+			// diagnostic's positive rows read the cause word WHILE their
+			// handler is servicing the interrupt and require the source's
+			// bit still up (row 0 compares for exactly master+counter1).
+			// Latches drop only on their own acknowledges.
 			return m_pic->acknowledge();
 		}
 		// Before ICW1 the 8259 cannot deliver anything (measured: asking
@@ -2072,6 +2102,8 @@ private:
 	uint8_t m_test_2f00 = 0;
 	uint8_t m_test_2c04 = 0;
 	bool m_kb_req_level = false;
+	bool m_kb_grant_silent = false;
+	attotime m_kb_ready_at = attotime::zero;
 	bool m_master_latch = false;
 };
 
@@ -2528,10 +2560,12 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 			if (m_master_latch) v |= 0x8000;
 			if ((m_rtc[0x0c] & m_rtc[0x0b] & 0x70) != 0) v |= 0x0001;
 			if (m_scsi_rst_irq || m_scsi_irq) v |= 0x0004;
-			// bit 3 is the console REQUEST LEVEL (either status bit up),
-			// not the latch: the loaded system's services read this word
-			// to decide whether the console needs processing
-			if (m_kb_status & 0x03) v |= 0x0008;
+			// bit 3 is the console source LATCH (pending cause), not the
+			// status level: WLTCDIAG's quiescence acknowledges the latch
+			// and requires the bit clear even while transmit-ready idles
+			// high, and its positive row 0 requires it clear while the
+			// ready bit is up
+			if (BIT(m_source_state, 2)) v |= 0x0008;
 			if (m_dma_tc) v |= 0x0020;
 			if (m_scc_cause) v |= 0x0010;
 			if (BIT(m_source_state, 1)) v |= 0x0040;
@@ -3186,23 +3220,26 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		// to have seen the bit low and left.
 		if (m_legacy_bios && m_pic_ready)
 		{
-			// The strobe's VALUE is the protocol. 0xCD (transmit side) and
-			// 0xCC (receive side) are the active strobes the console
-			// handlers cycle on - they consume the current grant, re-arm
-			// the micro and get answered, which is what carries both the
-			// print pump and the keyboard reader. Any other value (0x00,
-			// whatever WLTCDIAG's register happens to hold) is a plain
-			// acknowledge: it consumes the grant and re-arms NOTHING,
-			// which is what lets the diagnostic's quiescence check find
-			// both status bits low a millisecond after its single strobe.
-			uint8_t const strobe = data & 0xff;
+			// A strobe consumes the transmit-ready grant and answers
+			// nothing. If no grant is pending it arms the SLOW, SILENT
+			// restore: the ready bit returns several milliseconds later
+			// as pure status with no interrupt cause behind it - that is
+			// what leaves the idle console quiet (WLTCDIAG's quiescence
+			// windows and the PROGRAMMABLE TIMER delay calibration both
+			// demand it; the old always-answering strobe kept an idle
+			// pump churning at the poll rate and dilated the test's
+			// 3.6 ms delay to 17.8 ms with 88 parasitic services). A
+			// pending FAST grant - earned by a data byte this very
+			// service wrote - is deliberately left alone: it fires after
+			// the service ends and carries the print pump.
 			m_kb_status &= ~0x01;
-			if (strobe == 0xcd || strobe == 0xcc)
-			{
-				m_kb_ready_again = true;
-				m_kb_reply = 0xfa;
-				m_kb_timer->adjust(attotime::from_usec(200));
-			}
+			// no re-arm of any kind: transmit-ready returns only when a
+			// data byte earns it (the fast transmit-done grant). The
+			// diagnostic's positive row 0 reads 2b02 == 0x00 long after
+			// the last strobe, so the ready bit must not drift back up
+			// by itself. A pending FAST grant from a byte this service
+			// wrote is left alone - it fires after the service ends and
+			// carries the pump.
 			kb_req_sync();
 			return;
 		}
