@@ -1884,6 +1884,13 @@ private:
 		m_dma_reg[reg & 0x0f] = data;
 		switch (reg & 0x0f)
 		{
+		case 0x01:
+			// second mode byte selects the device on the channel: 1 is
+			// the SCSI/floppy group, 2 the SCC (WLTCDIAG's INTERRUPT
+			// CONTROL transfers a looped-back serial byte by DMA and
+			// expects the terminal count to interrupt)
+			m_dma_dev = data;
+			break;
 		case 0x02: m_dma_count = (m_dma_count & 0xff00) | data; break;
 		case 0x03: m_dma_count = (m_dma_count & 0x00ff) | (data << 8); break;
 		case 0x04: m_dma_addr = (m_dma_addr & 0xfff00) | data; break;
@@ -1935,9 +1942,35 @@ private:
 	}
 	TIMER_CALLBACK_MEMBER(dma_service_cb) { dma_service(); }
 	emu_timer *m_dma_timer = nullptr;
+	void scc_drq_w(int state)
+	{
+		// /W//REQ is active low
+		m_scc_drq = !state;
+		if (m_scc_drq)
+			m_dma_timer->adjust(attotime::zero);
+	}
+	bool m_scc_drq = false;
+	uint8_t m_dma_dev = 1;
 	void dma_service()
 	{
 		address_space &space = m_maincpu->space(AS_PROGRAM);
+		if (m_dma_dev == 2)
+		{
+			// SCC channel: direction from the command's own bits (0x44
+			// reads into memory), request from the SCC's RX DMA line;
+			// reading the data register takes the request down
+			while (dma_armed() && m_scc_drq)
+			{
+				if (BIT(m_dma_reg[0x0a], 2))
+					space.write_byte(m_dma_addr, m_scc->ab_dc_r(3));
+				else
+					m_scc->ab_dc_w(3, space.read_byte(m_dma_addr));
+				m_dma_addr = (m_dma_addr + 1) & 0xfffff;
+				if (m_dma_count-- == 0)
+					dma_complete();
+			}
+			return;
+		}
 		while (dma_armed() && m_dma_drq)
 		{
 			if (m_dma_recv)
@@ -2503,6 +2536,7 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 			if (m_scc_cause) v |= 0x0010;
 			if (BIT(m_source_state, 1)) v |= 0x0040;
 			if (BIT(m_source_state, 0)) v |= 0x0080;
+			if (BIT(m_test_2f00, 6)) v |= 0x0800;
 			return v;
 		}
 		return 0xc7db | ((m_scsi_rst_irq || m_scsi_irq) ? 0x0004 : 0) | (m_dma_tc ? 0x0020 : 0);
@@ -2968,7 +3002,26 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	// writes 0 on the way out). The 1986 BIOS init writes 0x80 then 0x00
 	// to 0x2f00, which is the same generator being parked after the POST.
 	if ((offset << 1) == 0x2f00 && ACCESSING_BITS_0_7)
+	{
+		// The test-interrupt generator, decoded from WLTCDIAG's rows 8/9:
+		// bit 6 FIRES the artificial serial cause (bit 11 of the cause
+		// word, level-follow), bit 4 routes the delivery to line 7
+		// instead of line 5 (row 9 masks line 5 first and requires the
+		// line-7 handler to run), and the acknowledge is simply dropping
+		// bit 6. Bit 7 gates the 2c04 per-source injection, as before.
+		uint8_t const prima = m_test_2f00;
 		m_test_2f00 = data & 0xff;
+		if (m_legacy_bios && m_pic_ready)
+		{
+			if (BIT(data, 6) && !BIT(prima, 6))
+				pic_ir(BIT(data, 4) ? 7 : 5, 1);
+			if (!BIT(data, 6) && BIT(prima, 6))
+			{
+				pic_ir(5, 0);
+				pic_ir(7, 0);
+			}
+		}
+	}
 	if ((offset << 1) == 0x2c04 && ACCESSING_BITS_0_7
 			&& m_legacy_bios && m_pic_ready && BIT(m_test_2f00, 7))
 	{
@@ -3958,6 +4011,8 @@ void wltc_state::wltc(machine_config &config)
 	SCC8530(config, m_scc, 4'915'200);
 	m_scc->configure_channels(4'915'200 / 32, 4'915'200 / 32, 4'915'200 / 32, 4'915'200 / 32);
 	m_scc->out_int_callback().set(FUNC(wltc_state::scc_int_w));
+	// the request-mode line WR1 arms is /W//REQ, active low
+	m_scc->out_wreqa_callback().set(FUNC(wltc_state::scc_drq_w));
 
 	// 8250-compatible UART at 0x3f8, with the usual 1.8432 MHz clock
 	INS8250(config, m_uart, 1'843'200);

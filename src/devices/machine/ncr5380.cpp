@@ -316,6 +316,28 @@ void ncr5380_device::icmd_w(u8 data)
 
 			LOGMASKED(LOG_SCSI, "changing control lines 0x%04x\n", ctrl);
 			m_scsi_bus->ctrl_w(m_scsi_refid, ctrl, mask);
+
+			// A self-driven S̅E̅L̅ never comes back through scsi_ctrl_changed
+			// (the bus only notifies the other devices), so the selection
+			// condition is checked here too: S̅E̅L̅ raised with an ID matching
+			// the armed Select Enable Register while B̅S̅Y̅ is free. Not
+			// during arbitration - an initiator that just won the bus
+			// momentarily shows exactly this signature between the ICR
+			// write that raises S̅E̅L̅ and the one that re-asserts B̅S̅Y̅, and
+			// the real part does not fire there. Outside arbitration it
+			// does: the Wang LapTop's diagnostic tests the selected
+			// interrupt by self-selection - S̅E̅L̅ plus its own ID from the
+			// initiator command register - and requires it.
+			u32 const now = m_scsi_bus->ctrl_r();
+			if (m_selen && !(m_mode & MODE_ARBITRATE)
+				&& (data & IC_SEL) && !(m_icmd & IC_SEL)
+				&& (now & S_SEL) && !(now & S_BSY)
+				&& (m_scsi_bus->data_r() & m_selen))
+			{
+				LOG("self-selected (sel-enable 0x%02x, data 0x%02x)\n",
+						m_selen, m_scsi_bus->data_r());
+				set_irq(true);
+			}
 		}
 	}
 	else
