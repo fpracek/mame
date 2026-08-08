@@ -1739,21 +1739,49 @@ private:
 			// Both status bits raise the request, exactly as in the gate
 			// array scheme: the loaded system's console pump LIVES on the
 			// transmit-ready interrupt (bit 0) - that is what makes its
-			// service send the next command out of 0x2c1e. Bit 0 being
-			// high most of the time does not flood a level-triggered
-			// controller here, because the firmware itself masks bit 2 of
-			// 0x2202 on the way out of the service and opens it again only
-			// when it has something to say (measured: its ISR ends with
-			// 2202=4). Exposing only bit 1 starved the pump - 129k console
-			// acknowledges in the working run against zero after the
-			// handover, no console output, no menu.
-			set_source(2, (m_kb_status & 0x03) != 0);
+			// service send the next command out of 0x2c1e.
+			//
+			// The request latches on a RISING EDGE of the composed status
+			// and the edge detector is separate from the latch: the 2b02
+			// read-acknowledge takes the latched request down but must NOT
+			// rewind the edge detector, or a status that merely STAYS high
+			// re-latches on the next poll and fires again. WLTCDIAG's
+			// INTERRUPT CONTROL runs a negative test on exactly this: it
+			// acknowledges, opens only bit 2 of the mask and demands
+			// silence while the transmit-ready bit idles high - re-latching
+			// per poll delivered a spurious console interrupt ~7 ms later
+			// and the suite declared the base unit faulty. The pump is
+			// still self-sustaining, because every 2c1e command drops the
+			// ready bit and the reply raises it again - a real new edge
+			// per cycle.
+			// The detector must also be updated wherever the status FALLS
+			// synchronously (the byte write clearing ready, the data read
+			// clearing byte-waiting) - see kb_req_sync - or a dip and
+			// re-grant inside one poll period is invisible and the edge
+			// is lost, which is how the DOS transition starved (measured:
+			// the drain wrote its last byte, the re-grant landed in the
+			// same 200us window, and no console interrupt ever came
+			// again).
+			kb_req_sync();
 		}
 		else if ((m_kb_status & 0x03) && !BIT(m_int_enable_2202, 2))
 		{
 			m_gate_vector = m_vector_base + 2;
 			m_maincpu->set_input_line(0, HOLD_LINE);
 		}
+	}
+	// recompute the console request level and latch on its rising edge;
+	// called from the poll and from every path that changes m_kb_status
+	// outside the poll
+	void kb_req_sync()
+	{
+		bool const level = (m_kb_status & 0x03) != 0;
+		if (m_pic_ready && level && !m_kb_req_level)
+		{
+			pic_ir(2, 1);
+			m_source_state |= 4;
+		}
+		m_kb_req_level = level;
 	}
 	TIMER_CALLBACK_MEMBER(rtc_periodic)
 	{
@@ -1975,6 +2003,7 @@ private:
 	bool m_expect_icw2 = false;
 	uint8_t m_test_2f00 = 0;
 	uint8_t m_test_2c04 = 0;
+	bool m_kb_req_level = false;
 };
 
 
@@ -2533,8 +2562,9 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 			if (!machine().side_effects_disabled())
 				{
 					m_kb_status &= ~0x02;
-					if (m_pic_ready)
-						set_source(2, false);
+					// the byte-waiting bit fell: keep the edge detector
+					// current so the next pending byte makes a real edge
+					kb_req_sync();
 				}
 			return m_kb_rx;
 		}
@@ -2565,16 +2595,6 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 		// controller's own interrupt line.
 		if (m_legacy_bios)
 		{
-			// reading the cause register is the console acknowledge - the
-			// same read-to-clear the SCSI/DMA group has on 0x2b0a; the
-			// periodic poll re-latches while a status bit is still up, so
-			// the delivery rate is the poll rate, exactly what the
-			// pulse-based fixed-vector scheme gave the firmware
-			if (m_pic_ready && !machine().side_effects_disabled())
-			{
-				pic_ir(2, 0);
-				m_source_state &= ~4;
-			}
 			floppy_image_device *const f = m_floppy->get_device();
 			return 0xc4
 					| ((f && f->exists()) ? 0 : 0x08)
@@ -2831,6 +2851,13 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 			{ pic_ir(0, 0); m_source_state &= ~1; }
 		if ((offset << 1) == 0x2c14 || (offset << 1) == 0x2c10)
 			{ pic_ir(1, 0); m_source_state &= ~2; }
+		// the console acknowledge is the strobe of either console port -
+		// 2c1e (the command strobe every service performs) or 2c10 (the
+		// generic acknowledge the POST and the loaded system's later
+		// handlers use). It clears the LATCH only; the edge detector in
+		// the poll is deliberately untouched, see there.
+		if ((offset << 1) == 0x2c1e || (offset << 1) == 0x2c10)
+			{ pic_ir(2, 0); m_source_state &= ~4; }
 	}
 
 	// Test-interrupt generator. WLTCDIAG's INTERRUPT CONTROL test arms
@@ -3009,6 +3036,9 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		{
 			m_kb_status &= ~0x01;
 			m_kb_ready_again = true;
+			// the ready bit fell: the edge detector must see the dip, or
+			// the re-grant inside the same poll period is no edge at all
+			kb_req_sync();
 		}
 		m_kb_reply = 0xfa;
 		m_kb_timer->adjust(attotime::from_usec(200));
