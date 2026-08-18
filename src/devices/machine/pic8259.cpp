@@ -36,7 +36,18 @@ TIMER_CALLBACK_MEMBER(pic8259_device::irq_timer_tick)
 		uint8_t mask = 1 << irq;
 
 		/* is this IRQ in service and not cascading and sfnm? */
-		if ((m_isr & mask) && !(m_master && m_cascade && m_nested && (m_slave & mask)))
+		/* Special mask mode (OCW3 bit 5) takes the in-service bits out
+		   of the priority decision entirely: only the mask register
+		   inhibits, so a handler can mask its own level, run with
+		   interrupts open, be preempted by any other level - higher or
+		   lower - and still finish with a normal EOI. The Wang LapTop's
+		   loaded BIOS is built on exactly that idiom: each handler sets
+		   its own bit in the mask on entry and writes the EOI last.
+		   Without this its tick handler, which drives the disk state
+		   machine, deadlocked against the SCSI level it was waiting for
+		   as soon as a rotate-on-specific-EOI put that level below it. */
+		if ((m_isr & mask) && !BIT(m_ocw3, 5)
+				&& !(m_master && m_cascade && m_nested && (m_slave & mask)))
 		{
 			LOG("pic8259_timerproc(): PIC IR%d still in service\n", irq);
 			break;
@@ -51,7 +62,7 @@ TIMER_CALLBACK_MEMBER(pic8259_device::irq_timer_tick)
 			return;
 		}
 		// if sfnm and in-service don't continue
-		if((m_isr & mask) && m_master && m_cascade && m_nested && (m_slave & mask))
+		if((m_isr & mask) && !BIT(m_ocw3, 5) && m_master && m_cascade && m_nested && (m_slave & mask))
 			break;
 	}
 	m_current_level = -1;
@@ -267,7 +278,7 @@ void pic8259_device::write(offs_t offset, uint8_t data)
 						m_ocw3 = (m_ocw3 & 0xfe) | (data & 0x01);
 					if (BIT(data, 2))
 						m_ocw3 |= 0x04;
-					// TODO: special mask mode
+					// special mask mode: bit 6 enables the change, bit 5 is the value
 					if (BIT(data, 6))
 						m_ocw3 = (m_ocw3 & 0xdf) | (data & 0x20);
 				}
