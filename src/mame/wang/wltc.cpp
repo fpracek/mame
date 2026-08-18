@@ -584,18 +584,21 @@ public:
 		m_unit_attention = true;
 		logerror("drive A raw: %s, %d cilindri x %d teste x %d settori\n",
 				filename(), m_cylinders, m_heads, m_spt);
+		m_scsi_id = m_id_slot;   // il cassetto pieno rientra sul bus
 		return std::make_pair(std::error_condition(), std::string());
 	}
 	virtual void call_unload() override
 	{
 		m_size = 0;
 		m_unit_attention = true;
+		m_scsi_id = -1;
 	}
 
 protected:
 	virtual void device_start() override ATTR_COLD
 	{
 		nscsi_full_device::device_start();
+		m_id_slot = m_scsi_id;
 		m_finish = timer_alloc(FUNC(wang_scsi_floppy_raw_device::finish_cb), this);
 		save_item(NAME(m_cyl));
 		save_item(NAME(m_unit_attention));
@@ -605,6 +608,13 @@ protected:
 	{
 		nscsi_full_device::device_reset();
 		m_unit_attention = true;
+		// Un'unita' esterna senza dischetto non deve bloccare l'avvio: il
+		// firmware prova Drive A per primo e, se quella risponde e poi
+		// fallisce il recalibrate, dichiara "79 Equipment Malfunction" e
+		// abbandona invece di passare al Winchester. Come il Winchester
+		// senza CHD, il cassetto vuoto esce dal bus, e ci rientra quando
+		// si inserisce un supporto.
+		m_scsi_id = exists() ? m_id_slot : -1;
 		set_status_delay(attotime::from_usec(500));
 		set_data_phase_timeout(attotime::from_msec(10));
 	}
@@ -719,6 +729,16 @@ protected:
 			for (int i = 0; i < m_scsi_cmdsize; i++)
 				cdb += util::string_format(" %02x", m_scsi_cmdbuf[i]);
 			logerror("drive A raw comando:%s\n", cdb);
+
+			// Senza dischetto nel cassetto solo i comandi che non toccano il
+			// supporto rispondono: gli altri danno Not Ready, e il BIOS passa
+			// all'unita' successiva invece di dichiarare un guasto.
+			if (!exists() && cmd != 0x03 && cmd != 0x08)
+			{
+				risultato_non_pronto(m_scsi_cmdbuf[5]);
+				m_finish->adjust(attotime::from_usec(200));
+				return;
+			}
 
 			switch (cmd)
 			{
@@ -899,6 +919,20 @@ private:
 		m_res[6] = sz;
 		m_res_n = 7;
 	}
+	// Nessun dischetto: il 765 risponde terminazione anomala con il bit
+	// Not Ready di ST0, non un errore di dati. E la differenza fra
+	// "cassetto vuoto" e "unita' guasta": con l'errore di dati il BIOS
+	// dichiarava "79 Drive A Equipment Malfunction" e abbandonava
+	// l'avvio, invece di passare al Winchester come fa il ferro con
+	// l'unita' esterna collegata e vuota.
+	void risultato_non_pronto(uint8_t unit)
+	{
+		m_res[0] = 0x48 | (unit & 7);   // ST0: AT + NR
+		m_res[1] = 0;
+		m_res[2] = 0;
+		m_res[3] = 0; m_res[4] = 0; m_res[5] = 0; m_res[6] = 0;
+		m_res_n = 7;
+	}
 	void errore_settore(uint8_t unit, int c, int h, int r, int sz, bool scrittura = false)
 	{
 		m_res[0] = 0x40 | (unit & 7); // terminazione anomala
@@ -931,6 +965,7 @@ private:
 		invia_messaggio();
 	}
 
+	int m_id_slot = 1;   // l'id assegnato dallo slot, per rientrare sul bus
 	emu_timer *m_finish = nullptr;
 	std::vector<uint8_t> m_data;
 	std::vector<uint8_t> m_write_buf;
