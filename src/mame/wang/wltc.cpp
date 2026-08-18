@@ -792,6 +792,16 @@ protected:
 				}
 				m_data.resize(bytes);
 				util::read_at(image_core_file(), offset_settore(c, h, r), m_data.data(), bytes);
+				{
+					uint32_t sum = 0;
+					for (uint8_t b : m_data) sum += b;
+					logerror("drive A raw: letti %u byte da offset %llu, somma=%08x, primi=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+							bytes, (unsigned long long)offset_settore(c, h, r), sum,
+							m_data.size() > 0 ? m_data[0] : 0, m_data.size() > 1 ? m_data[1] : 0,
+							m_data.size() > 2 ? m_data[2] : 0, m_data.size() > 3 ? m_data[3] : 0,
+							m_data.size() > 4 ? m_data[4] : 0, m_data.size() > 5 ? m_data[5] : 0,
+							m_data.size() > 6 ? m_data[6] : 0, m_data.size() > 7 ? m_data[7] : 0);
+				}
 				risultato_chrn(m_scsi_cmdbuf[5], c, h, eot + 1, sz);
 				// il tempo di una lettura vera: ~n giri di piatto emulati
 				m_finish->adjust(attotime::from_msec(4 + 2 * nsec));
@@ -1973,6 +1983,7 @@ private:
 			// phase stalled. The self test at F0375 writes 0x18, programs
 			// a count and never transfers: bit 6 clear, so still no run.
 			m_dma_go = BIT(data, 6);
+			if (m_dma_go) { m_dma_sum = 0; m_dma_first = true; }
 			// the disk driver writes the command before the address and
 			// the count, so there is nothing worth printing here yet
 			logerror("DMA command %02x\n", data);
@@ -2037,6 +2048,9 @@ private:
 			m_dma_timer->adjust(attotime::zero);
 	}
 	bool m_scc_drq = false;
+	uint32_t m_dma_sum = 0;
+	uint32_t m_dma_sum_start = 0;
+	bool m_dma_first = false;
 	uint8_t m_dma_dev = 1;
 	uint8_t m_dma_tc_chan = 0;
 	void dma_service()
@@ -2062,8 +2076,12 @@ private:
 		while (dma_armed() && m_dma_drq)
 		{
 			if (m_dma_recv)
-				space.write_byte(m_dma_addr,
-						m_dma_floppy ? m_fdc->dma_r() : m_scsi->dma_r());
+			{
+				uint8_t const val = m_dma_floppy ? m_fdc->dma_r() : m_scsi->dma_r();
+				space.write_byte(m_dma_addr, val);
+				if (m_dma_first) { m_dma_sum_start = m_dma_addr; m_dma_first = false; }
+				m_dma_sum += val;
+			}
 			else if (m_dma_floppy)
 				m_fdc->dma_w(space.read_byte(m_dma_addr));
 			else
@@ -2090,7 +2108,8 @@ private:
 			m_scsi->eop_w(1);
 			m_scsi->eop_w(0);
 		}
-		logerror("DMA complete, end address %05x\n", m_dma_addr);
+		logerror("DMA complete, end address %05x, recv-sum from %05x = %08x\n",
+				m_dma_addr, m_dma_sum_start, m_dma_sum);
 		// vector 0x23, unmasked by bit 3 of 0x2202 (active low)
 		if (m_pic_ready)
 		{
@@ -3295,6 +3314,7 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		// see, so the direction has to come from this side.
 		if ((offset & 7) == 5) m_dma_recv = false;
 		if ((offset & 7) == 7) m_dma_recv = true;
+		logerror("5380 reg%d = %02x\n", offset & 7, data & 0xff);
 		m_scsi->write(offset & 7, data & 0xff);
 		return;
 	}
