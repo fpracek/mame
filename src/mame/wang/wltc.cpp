@@ -894,6 +894,8 @@ protected:
 
 	virtual void scsi_put_data(int id, int pos, uint8_t data) override
 	{
+		logerror("drive A raw: scsi_put_data id=%d pos=%d data=%02x write_len=%u\n",
+				id, pos, data, m_write_len);
 		if (id == SBUF_MAIN && m_write_len)
 		{
 			m_write_buf[pos & 511] = data;
@@ -2093,7 +2095,12 @@ private:
 			else if (m_dma_floppy)
 				m_fdc->dma_w(space.read_byte(m_dma_addr));
 			else
-				m_scsi->dma_w(space.read_byte(m_dma_addr));
+			{
+				uint8_t const val = space.read_byte(m_dma_addr);
+				logerror("DMA send byte from %05x = %02x, count left %04x, drq=%d\n",
+						m_dma_addr, val, m_dma_count, m_dma_drq);
+				m_scsi->dma_w(val);
+			}
 			m_dma_addr = (m_dma_addr + 1) & 0xfffff;
 			if (m_dma_count-- == 0)
 				dma_complete();

@@ -339,6 +339,11 @@ void nscsi_full_device::target_recv_byte()
 	m_scsi_bus->ctrl_wait(m_scsi_refid, S_ACK, S_ACK);
 	m_scsi_state = (m_scsi_state & STATE_MASK) | (RECV_BYTE_T_WAIT_ACK_1 << SUB_SHIFT);
 	m_scsi_bus->ctrl_w(m_scsi_refid, S_REQ, S_REQ);
+	// same deadline as the send side (see target_send_byte): an initiator
+	// that has taken all the data it wants must not leave the target
+	// asserting REQ forever waiting for one more byte that never comes
+	if(!m_data_phase_timeout.is_zero() && (m_scsi_state & STATE_MASK) == TARGET_WAIT_DATA_OUT_BYTE)
+		m_data_timer->adjust(m_data_phase_timeout);
 	step(false);
 }
 
@@ -357,16 +362,24 @@ void nscsi_full_device::target_send_byte(uint8_t val)
 
 TIMER_CALLBACK_MEMBER(nscsi_full_device::data_phase_give_up)
 {
-	// The initiator has stopped acknowledging. Drop the byte it did not
-	// take, abandon what is left of the buffer and go on to whatever was
-	// queued behind the data - status, normally.
-	if((m_scsi_state >> SUB_SHIFT) != SEND_BYTE_T_WAIT_ACK_1)
-		return;
-	m_scsi_bus->data_w(m_scsi_refid, 0);
-	m_scsi_bus->ctrl_w(m_scsi_refid, 0, S_REQ);
-	m_scsi_bus->ctrl_wait(m_scsi_refid, 0, S_ACK);
-	m_scsi_state = TARGET_NEXT_CONTROL;
-	step(false);
+	// The initiator has stopped acknowledging - on the send side because it
+	// has taken all the bytes it wants, on the receive side because it has
+	// no more to offer. Either way, drop what is pending, abandon the rest
+	// of the buffer and go on to whatever was queued behind the data -
+	// status, normally.
+	switch(m_scsi_state >> SUB_SHIFT) {
+	case SEND_BYTE_T_WAIT_ACK_1:
+		m_scsi_bus->data_w(m_scsi_refid, 0);
+		[[fallthrough]];
+	case RECV_BYTE_T_WAIT_ACK_1:
+		m_scsi_bus->ctrl_w(m_scsi_refid, 0, S_REQ);
+		m_scsi_bus->ctrl_wait(m_scsi_refid, 0, S_ACK);
+		m_scsi_state = TARGET_NEXT_CONTROL;
+		step(false);
+		break;
+	default:
+		break;
+	}
 }
 
 uint8_t nscsi_full_device::scsi_get_data(int id, int pos)
