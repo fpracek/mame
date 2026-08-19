@@ -625,6 +625,8 @@ protected:
 
 	virtual void scsi_command() override
 	{
+		logerror("drive A raw: comando SCSI %02x, exists=%d unit_attention=%d\n",
+				m_scsi_cmdbuf[0], exists(), m_unit_attention);
 		m_sending = false;
 		switch (m_scsi_cmdbuf[0])
 		{
@@ -842,7 +844,7 @@ protected:
 				m_write_pos = 0;
 				m_write_buf.assign(512, 0);
 				risultato_chrn(m_scsi_cmdbuf[5], c, h, eot + 1, sz);
-				scsi_data_out(SBUF_MAIN, bytes);
+				scsi_data_out(SBUF_WRITE, bytes);
 				// il messaggio di stato lo manda scsi_put_data quando arriva
 				// l'ultimo byte; questo e' solo un paracadute molto lasco
 				m_finish->adjust(attotime::from_msec(500));
@@ -896,7 +898,7 @@ protected:
 	{
 		logerror("drive A raw: scsi_put_data id=%d pos=%d data=%02x write_len=%u\n",
 				id, pos, data, m_write_len);
-		if (id == SBUF_MAIN && m_write_len)
+		if (id == SBUF_WRITE && m_write_len)
 		{
 			m_write_buf[pos & 511] = data;
 			if ((pos & 511) == 511 || pos + 1 == int(m_write_len))
@@ -986,6 +988,13 @@ private:
 		invia_messaggio();
 	}
 
+	// own id for the write-data phase, distinct from SBUF_MAIN: that one
+	// also carries CDB bytes for the *next* command, and m_write_len only
+	// ever clears on a full write - a write the host abandons early (the
+	// same "sector count is a maximum" pattern as the read side) leaves
+	// it stuck nonzero, and the following command's CDB bytes would be
+	// silently diverted into the write buffer instead of m_scsi_cmdbuf
+	enum { SBUF_WRITE = 2 };
 	emu_timer *m_finish = nullptr;
 	std::vector<uint8_t> m_data;
 	std::vector<uint8_t> m_write_buf;
