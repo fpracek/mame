@@ -584,21 +584,18 @@ public:
 		m_unit_attention = true;
 		logerror("drive A raw: %s, %d cilindri x %d teste x %d settori\n",
 				filename(), m_cylinders, m_heads, m_spt);
-		m_scsi_id = m_id_slot;   // il cassetto pieno rientra sul bus
 		return std::make_pair(std::error_condition(), std::string());
 	}
 	virtual void call_unload() override
 	{
 		m_size = 0;
 		m_unit_attention = true;
-		m_scsi_id = -1;
 	}
 
 protected:
 	virtual void device_start() override ATTR_COLD
 	{
 		nscsi_full_device::device_start();
-		m_id_slot = m_scsi_id;
 		m_finish = timer_alloc(FUNC(wang_scsi_floppy_raw_device::finish_cb), this);
 		save_item(NAME(m_cyl));
 		save_item(NAME(m_unit_attention));
@@ -608,13 +605,13 @@ protected:
 	{
 		nscsi_full_device::device_reset();
 		m_unit_attention = true;
-		// Un'unita' esterna senza dischetto non deve bloccare l'avvio: il
-		// firmware prova Drive A per primo e, se quella risponde e poi
-		// fallisce il recalibrate, dichiara "79 Equipment Malfunction" e
-		// abbandona invece di passare al Winchester. Come il Winchester
-		// senza CHD, il cassetto vuoto esce dal bus, e ci rientra quando
-		// si inserisce un supporto.
-		m_scsi_id = exists() ? m_id_slot : -1;
+		// L'unita' resta sul bus anche a vuoto (e' cosi' che un vero
+		// cassetto esterno risponde: c'e', semplicemente senza supporto).
+		// Uscire dal bus a vuoto nascondeva l'unita' al censimento e la
+		// rendeva irraggiungibile per un inserimento a caldo dopo il
+		// boot; la risposta "not ready" sui comandi A0 basta gia' da
+		// sola a far passare il firmware al Winchester senza dichiarare
+		// un guasto.
 		set_status_delay(attotime::from_usec(500));
 		set_data_phase_timeout(attotime::from_msec(10));
 	}
@@ -632,6 +629,12 @@ protected:
 		switch (m_scsi_cmdbuf[0])
 		{
 		case SC_TEST_UNIT_READY:
+			if (!exists())
+			{
+				scsi_status_complete(SS_CHECK_CONDITION);
+				sense(false, SK_NOT_READY);
+				return;
+			}
 			scsi_status_complete(SS_GOOD);
 			return;
 
@@ -640,7 +643,11 @@ protected:
 			std::fill(std::begin(m_scsi_sense_buffer), std::end(m_scsi_sense_buffer), 0);
 			m_scsi_sense_buffer[0] = 0x70;
 			m_scsi_sense_buffer[7] = 8;
-			if (m_unit_attention)
+			if (!exists())
+			{
+				m_scsi_sense_buffer[2] = SK_NOT_READY;
+			}
+			else if (m_unit_attention)
 			{
 				m_scsi_sense_buffer[2] = SK_UNIT_ATTENTION;
 				m_scsi_sense_buffer[12] = 0x29;
@@ -815,6 +822,8 @@ protected:
 				int const eot = m_scsi_cmdbuf[10];
 				int const nsec = (eot >= r) ? (eot - r + 1) : 0;
 				uint32_t const bytes = nsec * (128 << sz);
+				logerror("drive A raw: tentativo scrittura, exists=%d readonly=%d dentro=%d\n",
+						exists(), is_readonly(), dentro(c, h, r, nsec));
 				if (!exists() || is_readonly() || !dentro(c, h, r, nsec))
 				{
 					errore_settore(m_scsi_cmdbuf[5], c, h, r, sz, true);
@@ -975,7 +984,6 @@ private:
 		invia_messaggio();
 	}
 
-	int m_id_slot = 1;   // l'id assegnato dallo slot, per rientrare sul bus
 	emu_timer *m_finish = nullptr;
 	std::vector<uint8_t> m_data;
 	std::vector<uint8_t> m_write_buf;
