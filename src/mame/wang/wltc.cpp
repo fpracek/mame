@@ -48,8 +48,11 @@
 #include "formats/pc_dsk.h"
 #include "machine/timer.h"
 #include "screen.h"
+#include "path.h"
 
+#include <chrono>
 #include <deque>
+#include <map>
 
 
 // The driver's own SCSI devices, defined at the bottom of this file
@@ -57,6 +60,8 @@ extern emu::detail::device_type_impl<nscsi_harddisk_device> const WANG_WINCHESTE
 extern emu::detail::device_type_impl<nscsi_full_device> const WANG_SCSI_FLOPPY;
 extern emu::detail::device_type_impl<nscsi_full_device> const WANG_SCSI_FLOPPY35;
 extern emu::detail::device_type_impl<nscsi_full_device> const WANG_SCSI_FLOPPY_RAW;
+extern emu::detail::device_type_impl<nscsi_full_device> const WANG_SCSI_FLOPPY_RAW525;
+extern emu::detail::device_type_impl<nscsi_full_device> const WANG_SCSI_FLOPPY_RAW35;
 
 namespace {
 
@@ -550,12 +555,220 @@ private:
 // that this synthetic target does not yet raise). That is the bounded
 // next step; see NOTE-RICOGNIZIONE.
 // ---------------------------------------------------------------------
+// -------------------------------------------------------------------
+// Immagine FAT12 costruita al volo da una cartella host, per i drive
+// raw a capacita' dichiarata (wangfddraw525/wangfddraw35, sotto). Il
+// layout dei 360K e' quello verificato byte per byte sui dischetti
+// Wang originali; i 720K seguono lo standard PC per quel formato
+// (media descriptor 0xf9, 3 settori per copia della FAT). E' presa
+// una volta sola al montaggio: le scritture successive del guest
+// restano nella RAM di MAME, come un vero dischetto che non viene
+// mai risalvato sull'host - non e' una cartella sincronizzata.
+struct wang_fat12_format
+{
+	uint32_t bps, spc, reserved, nfat, nroot, media, spf, spt, heads, total_sectors;
+	uint32_t bytes() const noexcept { return total_sectors * bps; }
+};
+
+static void wang_fat12_set(std::vector<uint8_t> &img, uint32_t fat_base, uint32_t n, uint32_t val)
+{
+	uint32_t off = fat_base + n + n / 2;
+	uint32_t cur = img[off] | (img[off + 1] << 8);
+	if (n & 1)
+		cur = (cur & 0x000f) | (val << 4);
+	else
+		cur = (cur & 0xf000) | val;
+	img[off] = cur & 0xff;
+	img[off + 1] = (cur >> 8) & 0xff;
+}
+
+// Nome DOS 8.3: maiuscolo, caratteri non validi sostituiti da '_',
+// riempito di spazi/troncato agli 11 byte del formato su disco.
+static std::string wang_dos_name(const std::string &nome)
+{
+	auto punto = nome.find_last_of('.');
+	std::string base = (punto == std::string::npos) ? nome : nome.substr(0, punto);
+	std::string ext = (punto == std::string::npos) ? std::string() : nome.substr(punto + 1);
+	auto pulisci = [](std::string s) {
+		std::string r;
+		for (char c : s)
+		{
+			c = char(toupper((unsigned char)c));
+			bool ok = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+					std::string("_-$#&@!%(){}'`~^").find(c) != std::string::npos;
+			r += ok ? c : '_';
+		}
+		return r;
+	};
+	base = pulisci(base);
+	ext = pulisci(ext);
+	base.resize(8, ' ');
+	ext.resize(3, ' ');
+	return base + ext;
+}
+
+// Impacchetta il contenuto (solo primo livello, niente sottocartelle)
+// di una cartella host in una nuova immagine FAT12 delle dimensioni
+// esatte del formato indicato. Fallisce (senza toccare 'img') se il
+// contenuto non entra o se due nomi collidono una volta troncati a
+// 8.3: chi chiama deve fermare l'avvio, non proseguire con
+// un'immagine troncata o con un file al posto di un altro.
+static bool wang_build_floppy_from_folder(const std::string &dir, const wang_fat12_format &fmt,
+		std::vector<uint8_t> &img, std::string &error_msg)
+{
+	struct voce { std::string nome; uint32_t size; std::chrono::system_clock::time_point mtime; };
+	std::vector<voce> file;
+	{
+		osd::directory::ptr d = osd::directory::open(dir);
+		if (!d)
+		{
+			error_msg = "impossibile leggere la cartella " + dir;
+			return false;
+		}
+		const osd::directory::entry *e;
+		while ((e = d->read()) != nullptr)
+			if (e->type == osd::directory::entry::entry_type::FILE)
+				file.push_back({ std::string(e->name), uint32_t(e->size), e->last_modified });
+	}
+	if (file.empty())
+	{
+		error_msg = "la cartella " + dir + " non contiene file";
+		return false;
+	}
+	if (file.size() > fmt.nroot)
+	{
+		error_msg = util::string_format("%u file, ma la directory del dischetto ha solo %u voci",
+				(unsigned)file.size(), fmt.nroot);
+		return false;
+	}
+
+	uint32_t fat_sect = fmt.reserved;
+	uint32_t root_sect = fmt.reserved + fmt.nfat * fmt.spf;
+	uint32_t data_sect = root_sect + (fmt.nroot * 32 + fmt.bps - 1) / fmt.bps;
+	uint32_t cluster_bytes = fmt.bps * fmt.spc;
+	uint32_t cluster_totali = (fmt.total_sectors - data_sect) / fmt.spc;
+
+	std::vector<uint32_t> cluster_per_file(file.size());
+	std::vector<std::string> nomi83(file.size());
+	std::map<std::string, std::string> nomi_visti;
+	uint32_t cluster_usati = 0;
+	for (size_t i = 0; i < file.size(); i++)
+	{
+		uint32_t n = (file[i].size + cluster_bytes - 1) / cluster_bytes;
+		if (n == 0) n = 1;
+		cluster_per_file[i] = n;
+		cluster_usati += n;
+
+		std::string n83 = wang_dos_name(file[i].nome);
+		auto trovato = nomi_visti.find(n83);
+		if (trovato != nomi_visti.end())
+		{
+			error_msg = "'" + file[i].nome + "' e '" + trovato->second +
+					"' diventano lo stesso nome DOS una volta troncati a 8.3";
+			return false;
+		}
+		nomi_visti[n83] = file[i].nome;
+		nomi83[i] = n83;
+	}
+	if (cluster_usati > cluster_totali)
+	{
+		error_msg = util::string_format(
+				"la cartella occupa %u byte (arrotondati a cluster), ma il formato scelto ne ha solo %u - non entra",
+				cluster_usati * cluster_bytes, cluster_totali * cluster_bytes);
+		return false;
+	}
+
+	img.assign(fmt.bytes(), 0);
+
+	img[0] = 0xeb; img[1] = 0x3c; img[2] = 0x90;
+	std::memcpy(&img[3], "Wang 3.0", 8);
+	img[11] = fmt.bps & 0xff; img[12] = (fmt.bps >> 8) & 0xff;
+	img[13] = fmt.spc & 0xff;
+	img[14] = fmt.reserved & 0xff; img[15] = (fmt.reserved >> 8) & 0xff;
+	img[16] = fmt.nfat & 0xff;
+	img[17] = fmt.nroot & 0xff; img[18] = (fmt.nroot >> 8) & 0xff;
+	img[19] = fmt.total_sectors & 0xff; img[20] = (fmt.total_sectors >> 8) & 0xff;
+	img[21] = fmt.media & 0xff;
+	img[22] = fmt.spf & 0xff; img[23] = (fmt.spf >> 8) & 0xff;
+	img[24] = fmt.spt & 0xff; img[25] = (fmt.spt >> 8) & 0xff;
+	img[26] = fmt.heads & 0xff; img[27] = (fmt.heads >> 8) & 0xff;
+	img[510] = 0xff; img[511] = 0x35; // non e' avviabile: niente firma 0x55aa
+
+	for (uint32_t k = 0; k < fmt.nfat; k++)
+	{
+		uint32_t off = (fat_sect + k * fmt.spf) * fmt.bps;
+		img[off] = fmt.media & 0xff; img[off + 1] = 0xff; img[off + 2] = 0xff;
+	}
+
+	uint32_t prossimo = 2, voce_dir = 0;
+	for (size_t i = 0; i < file.size(); i++)
+	{
+		std::vector<uint32_t> catena(cluster_per_file[i]);
+		for (uint32_t c = 0; c < cluster_per_file[i]; c++)
+			catena[c] = prossimo++;
+
+		for (uint32_t k = 0; k < fmt.nfat; k++)
+		{
+			uint32_t fat_base = (fat_sect + k * fmt.spf) * fmt.bps;
+			for (size_t c = 0; c + 1 < catena.size(); c++)
+				wang_fat12_set(img, fat_base, catena[c], catena[c + 1]);
+			wang_fat12_set(img, fat_base, catena.back(), 0xfff);
+		}
+
+		std::string percorso = util::path_concat(dir, file[i].nome);
+		util::core_file::ptr in;
+		if (!util::core_file::open(percorso, OPEN_FLAG_READ, in))
+		{
+			std::vector<uint8_t> dati(file[i].size);
+			if (!dati.empty())
+				util::read_at(*in, 0, dati.data(), dati.size());
+			uint32_t pos = 0;
+			for (uint32_t clu : catena)
+			{
+				uint32_t sett = data_sect + (clu - 2) * fmt.spc;
+				uint32_t n = std::min(cluster_bytes, uint32_t(dati.size()) - pos);
+				if (n > 0)
+				{
+					std::memcpy(&img[sett * fmt.bps], &dati[pos], n);
+					pos += n;
+				}
+			}
+		}
+
+		uint32_t entry_off = root_sect * fmt.bps + voce_dir * 32;
+		voce_dir++;
+		std::memcpy(&img[entry_off], nomi83[i].data(), 11);
+		img[entry_off + 11] = 0x20; // attributo ARCHIVE
+
+		time_t tt = std::chrono::system_clock::to_time_t(file[i].mtime);
+		std::tm tm{};
+#if defined(_WIN32)
+		localtime_s(&tm, &tt);
+#else
+		localtime_r(&tt, &tm);
+#endif
+		int anno = tm.tm_year + 1900;
+		if (anno < 1980) { anno = 1980; tm.tm_mon = 0; tm.tm_mday = 1; tm.tm_hour = tm.tm_min = tm.tm_sec = 0; }
+		uint16_t dos_time = uint16_t((tm.tm_hour << 11) | (tm.tm_min << 5) | (tm.tm_sec / 2));
+		uint16_t dos_date = uint16_t(((anno - 1980) << 9) | ((tm.tm_mon + 1) << 5) | tm.tm_mday);
+		img[entry_off + 22] = dos_time & 0xff; img[entry_off + 23] = (dos_time >> 8) & 0xff;
+		img[entry_off + 24] = dos_date & 0xff; img[entry_off + 25] = (dos_date >> 8) & 0xff;
+		img[entry_off + 26] = catena[0] & 0xff; img[entry_off + 27] = (catena[0] >> 8) & 0xff;
+		uint32_t sz = file[i].size;
+		img[entry_off + 28] = sz & 0xff; img[entry_off + 29] = (sz >> 8) & 0xff;
+		img[entry_off + 30] = (sz >> 16) & 0xff; img[entry_off + 31] = (sz >> 24) & 0xff;
+	}
+	return true;
+}
+
+static const wang_fat12_format WANG_FAT12_360K = { 512, 2, 1, 2, 112, 0xfd, 2, 9, 2, 720 };
+static const wang_fat12_format WANG_FAT12_720K = { 512, 2, 1, 2, 112, 0xf9, 3, 9, 2, 1440 };
+
 class wang_scsi_floppy_raw_device : public nscsi_full_device, public device_image_interface
 {
 public:
 	wang_scsi_floppy_raw_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0)
-		: nscsi_full_device(mconfig, WANG_SCSI_FLOPPY_RAW, tag, owner, clock)
-		, device_image_interface(mconfig, *this)
+		: wang_scsi_floppy_raw_device(mconfig, WANG_SCSI_FLOPPY_RAW, tag, owner, clock)
 	{ }
 
 	// image interface: a raw sector file, read/write, kept open
@@ -568,12 +781,73 @@ public:
 	virtual const char *file_extensions() const noexcept override { return "img,ima,dsk,raw"; }
 	virtual const char *image_type_name() const noexcept override { return "floppydisk"; }
 	virtual const char *image_brief_type_name() const noexcept override { return "flop"; }
+	// we open the path ourselves in call_load(), because a folder
+	// has to be detected and packed before anything can be opened
+	virtual bool core_opens_image_file() const noexcept override { return false; }
 
 	virtual std::pair<std::error_condition, std::string> call_load() override
 	{
+		std::string path(filename() ? filename() : "");
+		osd::directory::entry::ptr st = osd_stat(path);
+		bool e_cartella = st && st->type == osd::directory::entry::entry_type::DIR;
+
+		if (e_cartella && capacity_bytes() == 0)
+			throw emu_fatalerror("%s: e' una cartella, ma questa unita' non ha una capacita' dichiarata "
+					"per costruirci un dischetto (usa wangfddraw525 o wangfddraw35)", path);
+
+		if (e_cartella)
+		{
+			const wang_fat12_format &fmt = (capacity_bytes() == WANG_FAT12_720K.bytes()) ? WANG_FAT12_720K : WANG_FAT12_360K;
+			std::vector<uint8_t> img;
+			std::string errore;
+			if (!wang_build_floppy_from_folder(path, fmt, img, errore))
+				throw emu_fatalerror("%s: %s", path, errore);
+
+			// scritta di fianco alla cartella e poi montata come un
+			// file qualunque: e' un'istantanea rifatta a ogni avvio,
+			// non una cartella tenuta sincronizzata - device_image_
+			// interface non lascia costruire un m_file da qui senza
+			// passare per un file reale sull'host.
+			std::string img_path = path;
+			while (!img_path.empty() && (img_path.back() == '\\' || img_path.back() == '/'))
+				img_path.pop_back();
+			img_path += ".wangdisk.img";
+
+			util::core_file::ptr out;
+			std::error_condition scriverr = util::core_file::open(img_path,
+					OPEN_FLAG_READ | OPEN_FLAG_WRITE | OPEN_FLAG_CREATE, out);
+			if (scriverr || !out)
+				return std::make_pair(scriverr, std::string("impossibile creare " + img_path));
+			util::write_at(*out, 0, img.data(), img.size());
+			out->flush();
+			out.reset();
+
+			std::error_condition apri = load_image_by_path(OPEN_FLAG_READ | OPEN_FLAG_WRITE, img_path);
+			if (apri)
+				return std::make_pair(apri, std::string("impossibile montare l'immagine appena creata"));
+			logerror("drive raw: cartella %s impacchettata in %s (%u byte)\n", path, img_path, uint32_t(img.size()));
+		}
+		else
+		{
+			std::error_condition apri = load_image_by_path(OPEN_FLAG_READ | OPEN_FLAG_WRITE, path);
+			if (apri)
+			{
+				apri = load_image_by_path(OPEN_FLAG_READ, path);
+				if (apri)
+					return std::make_pair(apri, std::string("impossibile aprire il file"));
+			}
+			if (capacity_bytes() != 0)
+			{
+				uint64_t size = 0;
+				image_core_file().length(size);
+				if (size > capacity_bytes())
+					throw emu_fatalerror("%s: %u byte, supera i %u byte del formato scelto",
+							path, uint32_t(size), capacity_bytes());
+			}
+		}
+
 		uint64_t size = 0;
-		if (image_core_file().length(size))
-			return std::make_pair(image_error::UNSPECIFIED, "impossibile leggere la dimensione");
+		image_core_file().length(size);
 		// geometry by size; anything unrecognized becomes 512-byte
 		// sectors, 9 per track, two heads, cylinders to fit
 		m_spt = 9; m_heads = 2;
@@ -583,7 +857,7 @@ public:
 		m_size = size;
 		m_unit_attention = true;
 		logerror("drive A raw: %s, %d cilindri x %d teste x %d settori\n",
-				filename(), m_cylinders, m_heads, m_spt);
+				path, m_cylinders, m_heads, m_spt);
 		return std::make_pair(std::error_condition(), std::string());
 	}
 	virtual void call_unload() override
@@ -593,6 +867,17 @@ public:
 	}
 
 protected:
+	wang_scsi_floppy_raw_device(const machine_config &mconfig, device_type type, const char *tag, device_t *owner, uint32_t clock)
+		: nscsi_full_device(mconfig, type, tag, owner, clock)
+		, device_image_interface(mconfig, *this)
+	{ }
+
+	// 0 = nessuna capacita' dichiarata: si comporta come sempre (solo
+	// file, di qualunque dimensione, niente costruzione da cartella).
+	// Le derivate sotto (wangfddraw525/wangfddraw35) dichiarano 360K/
+	// 720K, sia per il controllo sia per la costruzione al volo.
+	virtual uint32_t capacity_bytes() const noexcept { return 0; }
+
 	virtual void device_start() override ATTR_COLD
 	{
 		nscsi_full_device::device_start();
@@ -2582,6 +2867,23 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	if (io_trap(offset << 1, 0xffff, mem_mask, false))
 		return 0xffff;
 
+	// OPT RAM PCB (512K->1M expansion) presence code, read by RAMDISK.EXE
+	// before it does anything else: bits 3:2 of this byte are the card's
+	// size/type code, 0 meaning "not fitted". Left unmapped, this reads
+	// as the driver's default open-bus value (0xffff -> 0xff -> code 3
+	// once RAMDISK.EXE shifts/masks it), which makes RAMDISK.EXE believe
+	// a card is present when none is emulated - traced live to a real,
+	// repeatable "General Failure error reading drive A" loop with no
+	// further SCSI activity at all: RAMDISK.EXE's own logic goes wrong
+	// on the phantom card, not the disk. See NOTE-RICOGNIZIONE.md, 20/8.
+	// The card itself (the actual extra 512K and how it's addressed once
+	// "present") is not emulated yet - this only clears the two bits
+	// RAMDISK.EXE inspects, leaving whatever else might share this port
+	// at its usual default (some boot-time check reacted badly to
+	// zeroing the whole byte - this port isn't only about the card).
+	if ((offset << 1) == 0x1026)
+		return m_unmapped_value & ~0x000c;
+
 	// I/O emulation trap latches (see io_trap)
 	if ((offset << 1) == 0x2b04)
 		return m_trap_desc;
@@ -2986,6 +3288,16 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 
 	if (io_trap(offset << 1, data, mem_mask, true))
 		return;
+
+	// OPT RAM PCB enable/config register, written right after the 0x1026
+	// presence code is read (see io_r): accepted and logged, no effect -
+	// the card's own memory window isn't emulated, only its "not fitted"
+	// answer at 0x1026 is, so nothing should ever try to use this yet.
+	if ((offset << 1) == 0x109c)
+	{
+		logerror("OPT RAM PCB: scrittura di configurazione %02x (nessuna espansione emulata)\n", data & 0xff);
+		return;
+	}
 
 	if ((offset << 1) == 0x2c04 && ACCESSING_BITS_0_7)
 		m_ctl_2c04 = data & 0xff;
@@ -4250,6 +4562,12 @@ void wltc_state::wltc(machine_config &config)
 		conn.option_add("wangfdd", WANG_SCSI_FLOPPY);
 		conn.option_add("wangfdd35", WANG_SCSI_FLOPPY35);
 		conn.option_add("wangfddraw", WANG_SCSI_FLOPPY_RAW);
+		// Come sopra, ma con una capacita' dichiarata (360K/720K): un
+		// -flopN che punta a una cartella viene impacchettato al volo
+		// in un dischetto di quella misura, e sia il file che la
+		// cartella vengono rifiutati (avvio bloccato) se non entrano.
+		conn.option_add("wangfddraw525", WANG_SCSI_FLOPPY_RAW525);
+		conn.option_add("wangfddraw35", WANG_SCSI_FLOPPY_RAW35);
 		if (id == 0)
 			conn.set_default_option("winchester");
 	}
@@ -4376,9 +4694,38 @@ protected:
 	virtual const char *drive_default() const override { return "35dd"; }
 };
 
+// Le due varianti a capacita' dichiarata del cassetto raw (vedi
+// wang_build_floppy_from_folder e capacity_bytes() piu' sopra): stessa
+// unita', solo con un tetto di 360K/720K che permette di impacchettare
+// una cartella host al volo e di rifiutare in avvio un file o una
+// cartella troppo grandi per il formato scelto.
+class wang_scsi_floppy_raw525_device : public wang_scsi_floppy_raw_device
+{
+public:
+	wang_scsi_floppy_raw525_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0)
+		: wang_scsi_floppy_raw_device(mconfig, WANG_SCSI_FLOPPY_RAW525, tag, owner, clock)
+	{ }
+
+protected:
+	virtual uint32_t capacity_bytes() const noexcept override { return WANG_FAT12_360K.bytes(); }
+};
+
+class wang_scsi_floppy_raw35_device : public wang_scsi_floppy_raw_device
+{
+public:
+	wang_scsi_floppy_raw35_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0)
+		: wang_scsi_floppy_raw_device(mconfig, WANG_SCSI_FLOPPY_RAW35, tag, owner, clock)
+	{ }
+
+protected:
+	virtual uint32_t capacity_bytes() const noexcept override { return WANG_FAT12_720K.bytes(); }
+};
+
 DEFINE_DEVICE_TYPE_PRIVATE(WANG_SCSI_FLOPPY, nscsi_full_device, wang_scsi_floppy_device, "wang_scsi_floppy", "Wang LapTop external floppy drive")
 DEFINE_DEVICE_TYPE_PRIVATE(WANG_SCSI_FLOPPY35, nscsi_full_device, wang_scsi_floppy35_device, "wang_scsi_floppy35", "Wang LapTop external floppy drive (3.5\")")
 DEFINE_DEVICE_TYPE_PRIVATE(WANG_SCSI_FLOPPY_RAW, nscsi_full_device, wang_scsi_floppy_raw_device, "wang_scsi_floppy_raw", "Wang LapTop external floppy drive (raw host file)")
+DEFINE_DEVICE_TYPE_PRIVATE(WANG_SCSI_FLOPPY_RAW525, nscsi_full_device, wang_scsi_floppy_raw525_device, "wang_scsi_floppy_raw525", "Wang LapTop external floppy drive (raw host file/folder, 360K)")
+DEFINE_DEVICE_TYPE_PRIVATE(WANG_SCSI_FLOPPY_RAW35, nscsi_full_device, wang_scsi_floppy_raw35_device, "wang_scsi_floppy_raw35", "Wang LapTop external floppy drive (raw host file/folder, 720K)")
 
 
 // The clones only preset the LAYOUT machine configuration, so the
