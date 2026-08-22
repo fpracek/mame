@@ -30,8 +30,10 @@ the source file's own header comment covers the hardware in more detail.
 - Wang video mode and both "Industry Standard" video modes (mono text
   and CGA, including 4-shade graphics)
 - Full keyboard: numeric keypad, F1-F36 (F1-F12 direct, F13-F24 via
-  Shift, F25-F36 via Shift+Ctrl), national layouts (US/IT/DE) built
-  into the driver as separate machine variants (`wltc`, `wltcit`, `wltcde`)
+  Shift, F25-F36 via Shift+Ctrl), national layouts (US/IT/DE) plus a
+  dedicated layout for a real WLTC keyboard (this project's USB replica),
+  built into the driver as separate machine variants (`wltc`, `wltcit`,
+  `wltcde`, `wltcusb`)
 - IBM-compatible software through the Translator (tested with Digger)
 - SCSI Winchester and floppy: reads *and* writes verified end-to-end,
   byte-exact, persistent across restarts, including hot-inserting a
@@ -98,6 +100,30 @@ mamewang.exe <machine> -bios <choice> -rompath <roms folder>
 | `wltc`    | American (US) |
 | `wltcit`  | Italian (IT) |
 | `wltcde`  | German (DE) |
+| `wltcusb` | Real WLTC keyboard (USB replica) |
+
+The four machines only preset the `Keyboard layout (host)` machine
+configuration setting (Machine Configuration menu, or `-layout` core
+config); everything else is identical. That setting is read once at
+reset, so changing it mid-session needs a "Reset System" from the same
+menu to take effect.
+
+- `US / WLTC native` and `Italian`/`German` patch the loaded translation
+  tables to make a PC keyboard (US, Italian, or German key captions)
+  type the expected characters - a convenience layer for anyone using
+  an ordinary PC keyboard, verified byte-by-byte against a real machine
+  (IT 20/20, DE 24/24).
+- `Real WLTC keyboard (USB replica)` is for the real WLTC keyboard
+  layout (this project's USB replica, or any future one) rather than a
+  PC keyboard: it applies none of the PC-adaptation remaps, and fixes
+  the one native gap that affects a real keyboard specifically - the
+  American stock BIOS never assigns a character to the driver's own
+  dedicated backslash key (internal keycode 0x54), a gap no PC keyboard
+  would ever notice since it has no physical key at that position.
+  Fixed on both sides: the Wang-mode table (verified from the Wang
+  menu/BASIC/File Spec fields) and the separate DOS/Industry-Standard
+  XLAT archive (verified echoing "\" at the DOS prompt) - both use the
+  same offset-by-keycode addressing, just at different base addresses.
 
 | `-bios`   | |
 |---|---|

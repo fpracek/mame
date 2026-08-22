@@ -1907,6 +1907,13 @@ private:
 		{ 0x020b, 0x28, 0x29 }, { 0x0213, 0x29, 0x3d },   // shift 9 / 0
 		{ 0x045d, 0x3c, 0x3b }, { 0x045e, 0x3e, 0x3a },   // shift , ; e . :
 	};
+	// Real WLTC keyboard: the I.S. archive uses the same offset-by-keycode
+	// addressing as the Wang-mode table above (confirmed live: poking this
+	// cell to 0x42 made "\" echo at the DOS prompt) - one entry, no other
+	// PC-adaptation remap needed.
+	static constexpr patch_is PATCH_IS_WLTCUSB[] = {
+		{ 0x0054, 0x4e, 0x42 },   // tasto backslash del driver -> cella backslash
+	};
 
 	void costruisci_ricetta_wang(uint32_t B)
 	{
@@ -1927,6 +1934,18 @@ private:
 			return -1;
 		};
 		m_kb_recipe.clear();
+		if (m_layout_active == 3)
+		{
+			// Real WLTC keyboard (the USB replica): every key already sits
+			// where the driver expects it, so none of the PC-adaptation
+			// remaps below apply. The one native gap is keycode 0x54 (this
+			// driver's dedicated backslash key, see the KB_CODE table
+			// above) - the American stock table leaves it dead. Give it
+			// the same backslash cell the IT/DE recipes use and leave
+			// everything else, backtick included, untouched.
+			put(B + 0x54, 0x42);
+			return;
+		}
 		int const l1 = trova("357890;',");
 		int const l2 = trova("=1246/-+");
 		int const lb = trova("[]\\`");
@@ -2012,8 +2031,9 @@ private:
 					if (!m_kb_recipe.empty())
 					{
 						m_kb_recipe_base = B;
-						logerror("layout %s (Wang) applicato, tabella a %05X\n",
-								m_layout_active == 1 ? "IT" : "DE", B);
+						char const *const nome = m_layout_active == 1 ? "IT"
+								: m_layout_active == 2 ? "DE" : "WLTC-reale";
+						logerror("layout %s (Wang) applicato, tabella a %05X\n", nome, B);
 					}
 				}
 				if (B == m_kb_recipe_base)
@@ -2023,7 +2043,13 @@ private:
 			}
 		}
 
-		// lato I.S.: archivio di XLAT, trovato per firma (coppie alias a +0x80)
+		// lato I.S.: archivio di XLAT, trovato per firma (coppie alias a +0x80).
+		// Stessa tabella indicizzata per keycode del lato Wang, verificato
+		// per tutti e tre i layout con un test di eco.
+		auto const *patch = m_layout_active == 1 ? PATCH_IS_IT
+				: m_layout_active == 2 ? PATCH_IS_DE : PATCH_IS_WLTCUSB;
+		int const n = m_layout_active == 1 ? int(std::size(PATCH_IS_IT))
+				: m_layout_active == 2 ? int(std::size(PATCH_IS_DE)) : int(std::size(PATCH_IS_WLTCUSB));
 		if (!m_is_arch_base)
 		{
 			for (uint32_t base = 0xe0000; base < 0xeff00 && !m_is_arch_base; base += 16)
@@ -2037,8 +2063,6 @@ private:
 			if (m_is_arch_base)
 			{
 				m_is_arch_valido = true;
-				auto const *patch = (m_layout_active == 1) ? PATCH_IS_IT : PATCH_IS_DE;
-				int const n = (m_layout_active == 1) ? int(std::size(PATCH_IS_IT)) : int(std::size(PATCH_IS_DE));
 				for (int i = 0; i < n && m_is_arch_valido; i++)
 				{
 					uint8_t const v = sp.read_byte(m_is_arch_base + patch[i].off);
@@ -2054,8 +2078,6 @@ private:
 		}
 		if (m_is_arch_base && m_is_arch_valido)
 		{
-			auto const *patch = (m_layout_active == 1) ? PATCH_IS_IT : PATCH_IS_DE;
-			int const n = (m_layout_active == 1) ? int(std::size(PATCH_IS_IT)) : int(std::size(PATCH_IS_DE));
 			for (int i = 0; i < n; i++)
 				if (sp.read_byte(m_is_arch_base + patch[i].off) != patch[i].nuovo)
 					sp.write_byte(m_is_arch_base + patch[i].off, patch[i].nuovo);
@@ -4436,38 +4458,61 @@ static INPUT_PORTS_START( wltc )
 	// EMULATION clean. The fixed-vector path stays selectable as the
 	// fallback.
 	PORT_CONFNAME( 0x0008, 0x0008, "8259 handover" )
-	PORT_CONFSETTING(      0x0000, "off (percorso a vettore fisso)" )
+	PORT_CONFSETTING(      0x0000, "off (fixed vector path)" )
 	PORT_CONFSETTING(      0x0008, "on (base 0x80)" )
 
 	// National layout of the HOST keyboard: the driver patches the
 	// loaded translation tables (Wang lists + XLAT's IS archive) the way
-	// a national software build would ship them. "US / WLTC nativa" is
-	// the untouched American build - also the right choice for a real
-	// WLTC replica keyboard, whose keys then do what their caps say.
-	// Read at reset; the wltcit / wltcde machines preset it.
+	// a national software build would ship them. "US / WLTC nativa" plays
+	// back the untouched American build, for a PC keyboard mapped onto
+	// the American key positions. A real WLTC replica keyboard (every
+	// key on its own switch, caps matching the driver's PORT_NAME table)
+	// wants "Real WLTC keyboard" instead: the American stock build never
+	// assigns a character to this driver's dedicated backslash key
+	// (keycode 0x54 - see the KB_CODE table and costruisci_ricetta_wang
+	// above), a gap no PC keyboard would ever notice since it has no
+	// switch wired to that position in the first place. That one setting
+	// is the only thing a replica-keyboard owner should ever need to
+	// touch here, whatever their own OS/locale - "Italian"/"German"
+	// exist only to adapt an Italian/German PC keyboard's key captions,
+	// not for the replica.
+	// Read at reset; the wltcit / wltcde / wltcusb machines preset it.
 	PORT_START("LAYOUT")
-	PORT_CONFNAME( 0x0003, 0x0000, "Layout tastiera (host)" )
-	PORT_CONFSETTING(      0x0000, "US / WLTC nativa" )
-	PORT_CONFSETTING(      0x0001, "Italiana" )
-	PORT_CONFSETTING(      0x0002, "Tedesca" )
+	PORT_CONFNAME( 0x0003, 0x0000, "Keyboard layout (host)" )
+	PORT_CONFSETTING(      0x0000, "US / WLTC native" )
+	PORT_CONFSETTING(      0x0001, "Italian" )
+	PORT_CONFSETTING(      0x0002, "German" )
+	PORT_CONFSETTING(      0x0003, "Real WLTC keyboard (USB replica)" )
 INPUT_PORTS_END
 
 static INPUT_PORTS_START( wltcit )
 	PORT_INCLUDE( wltc )
 	PORT_MODIFY("LAYOUT")
-	PORT_CONFNAME( 0x0003, 0x0001, "Layout tastiera (host)" )
-	PORT_CONFSETTING(      0x0000, "US / WLTC nativa" )
-	PORT_CONFSETTING(      0x0001, "Italiana" )
-	PORT_CONFSETTING(      0x0002, "Tedesca" )
+	PORT_CONFNAME( 0x0003, 0x0001, "Keyboard layout (host)" )
+	PORT_CONFSETTING(      0x0000, "US / WLTC native" )
+	PORT_CONFSETTING(      0x0001, "Italian" )
+	PORT_CONFSETTING(      0x0002, "German" )
+	PORT_CONFSETTING(      0x0003, "Real WLTC keyboard (USB replica)" )
 INPUT_PORTS_END
 
 static INPUT_PORTS_START( wltcde )
 	PORT_INCLUDE( wltc )
 	PORT_MODIFY("LAYOUT")
-	PORT_CONFNAME( 0x0003, 0x0002, "Layout tastiera (host)" )
-	PORT_CONFSETTING(      0x0000, "US / WLTC nativa" )
-	PORT_CONFSETTING(      0x0001, "Italiana" )
-	PORT_CONFSETTING(      0x0002, "Tedesca" )
+	PORT_CONFNAME( 0x0003, 0x0002, "Keyboard layout (host)" )
+	PORT_CONFSETTING(      0x0000, "US / WLTC native" )
+	PORT_CONFSETTING(      0x0001, "Italian" )
+	PORT_CONFSETTING(      0x0002, "German" )
+	PORT_CONFSETTING(      0x0003, "Real WLTC keyboard (USB replica)" )
+INPUT_PORTS_END
+
+static INPUT_PORTS_START( wltcusb )
+	PORT_INCLUDE( wltc )
+	PORT_MODIFY("LAYOUT")
+	PORT_CONFNAME( 0x0003, 0x0003, "Keyboard layout (host)" )
+	PORT_CONFSETTING(      0x0000, "US / WLTC native" )
+	PORT_CONFSETTING(      0x0001, "Italian" )
+	PORT_CONFSETTING(      0x0002, "German" )
+	PORT_CONFSETTING(      0x0003, "Real WLTC keyboard (USB replica)" )
 INPUT_PORTS_END
 
 
@@ -4730,11 +4775,14 @@ DEFINE_DEVICE_TYPE_PRIVATE(WANG_SCSI_FLOPPY_RAW35, nscsi_full_device, wang_scsi_
 
 // The clones only preset the LAYOUT machine configuration, so the
 // national keyboard can be picked from the command line:
-//   mamewang wltcit   (italiana)      mamewang wltcde   (tedesca)
+//   mamewang wltcit   (italiana)      mamewang wltcde    (tedesca)
+//   mamewang wltcusb  (real WLTC replica keyboard, any host OS/locale)
 #define rom_wltcit rom_wltc
 #define rom_wltcde rom_wltc
+#define rom_wltcusb rom_wltc
 
-//    YEAR  NAME    PARENT  COMPAT  MACHINE  INPUT   CLASS       INIT        COMPANY              FULLNAME                                    FLAGS
-COMP( 1987, wltc,   0,      0,      wltc,    wltc,   wltc_state, empty_init, "Wang Laboratories", "Wang LapTop Computer",                      MACHINE_NOT_WORKING | MACHINE_NO_SOUND )
-COMP( 1987, wltcit, wltc,   0,      wltc,    wltcit, wltc_state, empty_init, "Wang Laboratories", "Wang LapTop Computer (tastiera italiana)",  MACHINE_NOT_WORKING | MACHINE_NO_SOUND )
-COMP( 1987, wltcde, wltc,   0,      wltc,    wltcde, wltc_state, empty_init, "Wang Laboratories", "Wang LapTop Computer (deutsche Tastatur)",  MACHINE_NOT_WORKING | MACHINE_NO_SOUND )
+//    YEAR  NAME     PARENT  COMPAT  MACHINE  INPUT    CLASS       INIT        COMPANY              FULLNAME                                          FLAGS
+COMP( 1987, wltc,    0,      0,      wltc,    wltc,    wltc_state, empty_init, "Wang Laboratories", "Wang LapTop Computer",                            MACHINE_NOT_WORKING | MACHINE_NO_SOUND )
+COMP( 1987, wltcit,  wltc,   0,      wltc,    wltcit,  wltc_state, empty_init, "Wang Laboratories", "Wang LapTop Computer (tastiera italiana)",        MACHINE_NOT_WORKING | MACHINE_NO_SOUND )
+COMP( 1987, wltcde,  wltc,   0,      wltc,    wltcde,  wltc_state, empty_init, "Wang Laboratories", "Wang LapTop Computer (deutsche Tastatur)",        MACHINE_NOT_WORKING | MACHINE_NO_SOUND )
+COMP( 1987, wltcusb, wltc,   0,      wltc,    wltcusb, wltc_state, empty_init, "Wang Laboratories", "Wang LapTop Computer (real WLTC replica keyboard)", MACHINE_NOT_WORKING | MACHINE_NO_SOUND )
