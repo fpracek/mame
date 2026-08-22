@@ -31,9 +31,11 @@ the source file's own header comment covers the hardware in more detail.
   and CGA, including 4-shade graphics)
 - Full keyboard: numeric keypad, F1-F36 (F1-F12 direct, F13-F24 via
   Shift, F25-F36 via Shift+Ctrl), national layouts (US/IT/DE) plus a
-  dedicated layout for a real WLTC keyboard (this project's USB replica),
-  built into the driver as separate machine variants (`wltc`, `wltcit`,
-  `wltcde`, `wltcusb`)
+  dedicated layout for a real WLTC keyboard - a USB replica built for
+  this project, PCB and Pico firmware at
+  [fpracek/wltc-usb-keyboard](https://github.com/fpracek/wltc-usb-keyboard)
+  - built into the driver as separate machine variants (`wltc`,
+  `wltcit`, `wltcde`, `wltcusb`)
 - IBM-compatible software through the Translator (tested with Digger)
 - SCSI Winchester and floppy: reads *and* writes verified end-to-end,
   byte-exact, persistent across restarts, including hot-inserting a
