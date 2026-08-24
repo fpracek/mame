@@ -43,6 +43,16 @@ the source file's own header comment covers the hardware in more detail.
 - Serial (SCC) loopback and DMA transfers
 - 8259-based interrupt path (the default; a fixed-vector fallback also
   exists in the driver for reference)
+- **OPT RAM PCB** (the 512K memory expansion card, model WLTC-3-1):
+  presence sensed on port 0x2d00 bit 0, found by disassembling the boot
+  PROM's own memory test and confirmed against BIOS.SYS - see
+  Parameters below. Verified against a real machine (chkdsk: 512K
+  without the card, 704K with it, matching the emulated behaviour
+  exactly). The 704K figure - not the naive 512+512 - is genuine WLTC
+  behaviour: with the card present the BIOS hands its 8 banks the
+  main-memory role outright and only relocates 3 of the displaced
+  standard RAM PCB's 8 banks elsewhere; the other 5 (320K) go unused,
+  confirmed in BIOS.SYS's own code, not a driver simplification.
 
 ## Known limitations
 
@@ -75,12 +85,6 @@ the source file's own header comment covers the hardware in more detail.
   spurious "Not ready" then "General Failure" loop while the
   underlying SCSI reads keep succeeding underneath - under
   investigation, mechanism not yet identified.
-- **OPT RAM PCB** (the 512K->1M memory expansion card): the driver
-  answers the card-presence I/O port (0x1026) as "not fitted" so
-  software that probes for it (like RAMDISK.EXE) doesn't act on a
-  phantom card, and logs the matching configuration write (0x109c).
-  The card itself - the actual extra 512K and how software would
-  address it once "present" - is not emulated.
 - **NEC V30 core timing**: measured ~10% pessimistic on memory-access-
   heavy code compared to real hardware (108.9 clock/loop measured vs.
   120.4 emulated) - a MAME core-wide characteristic, not specific to
@@ -132,6 +136,21 @@ menu to take effect.
 | `v1986`   | 1986 BIOS - the only path that boots correctly, always use this |
 | `v40203`  | BIOS 4.02.03 - does not work, see Known limitations |
 | `v400`    | BIOS 4.00 as shipped on the system diskette - experimental |
+
+### OPT RAM PCB (memory expansion)
+
+Machine Configuration setting "OPT RAM PCB", read at reset:
+
+| setting | |
+|---|---|
+| `Not installed` (default) | 512K, matches the base machine |
+| `Installed (512K, WLTC-3-1)` | 704K - see What works above for why not 1024K |
+
+Presence is sensed on port 0x2d00 bit 0 (active low), found by
+disassembling the boot PROM's own "512K main memory & 512K Option"
+kernel test (its failure path prints the exact "51 Memory Error -
+Option Memory Test" string) and confirmed in BIOS.SYS, which reads the
+same bit right before deciding how much memory to report to DOS.
 
 ### Hard disk (Winchester)
 

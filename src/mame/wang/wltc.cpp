@@ -41,6 +41,7 @@
 #include "machine/pit8253.h"
 #include "machine/ncr5380.h"
 #include "machine/z80scc.h"
+#include "bus/rs232/rs232.h"
 #include "bus/nscsi/devices.h"
 #include "bus/nscsi/hd.h"
 #include "machine/upd765.h"
@@ -1512,6 +1513,13 @@ private:
 	uint8_t m_kb_reply = 0;
 	uint8_t m_index_sel = 0xff;
 	uint8_t m_rtc[0x40];
+	// Backing for CPU block 10 (0xa0000-0xaffff) when the OPT RAM PCB is
+	// installed - one of the STD RAM PCB's own banks lands here (see
+	// io_r's 0x2d00 comment), distinct from the "fram" debug mirror the
+	// static map otherwise puts at this address, so the two never alias
+	// the same bytes for two different reasons.
+	uint8_t m_optram2[0x10000];
+	bool m_optram_installed = false;
 	uint16_t m_unmapped_value = 0xffff;
 	uint8_t m_vram_bank[2] = { 0, 0 };
 	// video memory behind the 8K window at 0xf2000: sixteen banks, of
@@ -2889,22 +2897,39 @@ uint16_t wltc_state::io_r(offs_t offset, uint16_t mem_mask)
 	if (io_trap(offset << 1, 0xffff, mem_mask, false))
 		return 0xffff;
 
-	// OPT RAM PCB (512K->1M expansion) presence code, read by RAMDISK.EXE
-	// before it does anything else: bits 3:2 of this byte are the card's
-	// size/type code, 0 meaning "not fitted". Left unmapped, this reads
-	// as the driver's default open-bus value (0xffff -> 0xff -> code 3
-	// once RAMDISK.EXE shifts/masks it), which makes RAMDISK.EXE believe
-	// a card is present when none is emulated - traced live to a real,
-	// repeatable "General Failure error reading drive A" loop with no
-	// further SCSI activity at all: RAMDISK.EXE's own logic goes wrong
-	// on the phantom card, not the disk. See NOTE-RICOGNIZIONE.md, 20/8.
-	// The card itself (the actual extra 512K and how it's addressed once
-	// "present") is not emulated yet - this only clears the two bits
-	// RAMDISK.EXE inspects, leaving whatever else might share this port
-	// at its usual default (some boot-time check reacted badly to
-	// zeroing the whole byte - this port isn't only about the card).
+	// RAMDISK.EXE reads this before it does anything else and treats
+	// bits 3:2 as the card's size/type code, 0 meaning "not fitted" -
+	// but this port turned out to be a dead end for the real mechanism:
+	// neither WLTCDIAG.EXE nor the boot PROM ever reference it (checked
+	// by disassembling both), and RAMDISK.EXE itself is Wang PC generic
+	// software, not written for the WLTC's actual memory hardware - it
+	// goes wrong on its own (a real, repeatable "General Failure error
+	// reading drive A" loop with no further SCSI activity at all) once
+	// it believes a card is present, which the driver's default open-bus
+	// value (0xffff -> 0xff -> code 3 once shifted/masked) makes it
+	// believe. See NOTE-RICOGNIZIONE.md, 20/8. Left as a safe, inert
+	// stub - some boot-time check reacted badly to zeroing the whole
+	// byte, so only the two bits RAMDISK.EXE inspects are cleared,
+	// everything else at this port kept at its usual default. The real
+	// presence check is 0x2d00 below.
 	if ((offset << 1) == 0x1026)
 		return m_unmapped_value & ~0x000c;
+
+	// OPT RAM PCB presence, read by both the boot PROM's kernel test 07
+	// ("512K main memory & 512K Option") and by BIOS.SYS before it
+	// decides how much memory to report to DOS - found by disassembling
+	// the boot PROM (bit 0 gates the PROM's own "Option Memory Test",
+	// with the exact "51 Memory Error - Option Memory Test" string
+	// right in its failure path) and confirmed in BIOS.SYS itself (the
+	// same bit, read at file offset 0x5181, decides whether to relocate
+	// three STD RAM PCB banks up to blocks 8-10 and hand blocks 0-7 to
+	// the OPT card instead - see machine_reset). Active low: 0 = card
+	// present, matching a card with no chip of its own, sensed by a
+	// ground strap the motherboard reads - exactly what the card's own
+	// photos show (Wolfgang, 20/8: two RAM modules identical to the
+	// standard one, no ID chip, just a 90-degree-rotated connector).
+	if ((offset << 1) == 0x2d00)
+		return (m_unmapped_value & ~1) | (m_optram_installed ? 0 : 1);
 
 	// I/O emulation trap latches (see io_trap)
 	if ((offset << 1) == 0x2b04)
@@ -3886,6 +3911,26 @@ void wltc_state::machine_reset()
 	// the layout is read once per boot: changing the setting in the UI
 	// takes effect at the next soft reset
 	m_layout_active = m_layout->read() & 3;
+
+	// OPT RAM PCB, read once per boot like the layout above. When
+	// installed, BIOS.SYS relocates three of the STD RAM PCB's eight
+	// banks up to CPU blocks 8-10 (0x80000-0xaffff) and lets the OPT
+	// card's own bank take over blocks 0-7 in its place - verified in
+	// BIOS.SYS itself (the block-select writes to 0x2d10/0x2d12/0x2d14
+	// right after the presence read at 0x2d00, offset 0x5181) and
+	// cross-checked against a live machine (512K -> 704K on chkdsk).
+	// Blocks 0-9 are already flat RAM here either way (the "640K POST
+	// pattern-tests as one block" simplification the mem_map comment
+	// documents), so only block 10 needs a runtime decision: give it
+	// real backing distinct from the "fram" debug mirror the static map
+	// otherwise puts there, so the two purposes never alias the same
+	// bytes.
+	m_optram_installed = BIT(ioport("OPTRAM")->read(), 0);
+	if (m_optram_installed)
+		m_maincpu->space(AS_PROGRAM).install_ram(0xa0000, 0xaffff, m_optram2);
+	else
+		m_maincpu->space(AS_PROGRAM).install_ram(0xa0000, 0xaffff,
+				reinterpret_cast<uint8_t *>(m_fram.target()));
 	m_kb_recipe_base = 0;
 	m_kb_recipe.clear();
 	m_is_arch_base = 0;
@@ -4483,6 +4528,19 @@ static INPUT_PORTS_START( wltc )
 	PORT_CONFSETTING(      0x0001, "Italian" )
 	PORT_CONFSETTING(      0x0002, "German" )
 	PORT_CONFSETTING(      0x0003, "Real WLTC keyboard (USB replica)" )
+
+	// Whether the OPT RAM PCB (512K, model WLTC-3-1 per the maintenance
+	// manual) is plugged into the MAIN PCB. Read at reset. When
+	// installed, the OPT card's own 512K takes over CPU blocks 0-7 and
+	// three of the STD RAM PCB's eight banks relocate to blocks 8-10
+	// instead, bringing DOS-visible memory from 512K to 704K - verified
+	// both in BIOS.SYS and on a real machine (Wolfgang, 23-24/8: chkdsk
+	// 512K without the card, 704K with it, port 0x2d00 unchanged FF in
+	// both cases - it was never the presence bit; see io_r).
+	PORT_START("OPTRAM")
+	PORT_CONFNAME( 0x0001, 0x0000, "OPT RAM PCB" )
+	PORT_CONFSETTING(      0x0000, "Not installed" )
+	PORT_CONFSETTING(      0x0001, "Installed (512K, WLTC-3-1)" )
 INPUT_PORTS_END
 
 static INPUT_PORTS_START( wltcit )
@@ -4674,6 +4732,18 @@ void wltc_state::wltc(machine_config &config)
 	m_scc->out_int_callback().set(FUNC(wltc_state::scc_int_w));
 	// the request-mode line WR1 arms is /W//REQ, active low
 	m_scc->out_wreqa_callback().set(FUNC(wltc_state::scc_drq_w));
+
+	// Channel A's data pins, out to a host-reachable null-modem socket, for
+	// testing a serial-to-network bridge against real DOS software. This is
+	// new wiring, not something the real board has documented: nothing in
+	// the machine drove these pins before (see the ctsa_w/dcda_w hardwiring
+	// in machine_reset, which stays as is - this only adds the data path,
+	// it does not touch modem-line behaviour anything else depends on).
+	m_scc->out_txda_callback().set("comma", FUNC(rs232_port_device::write_txd));
+	m_scc->out_rtsa_callback().set("comma", FUNC(rs232_port_device::write_rts));
+	m_scc->out_dtra_callback().set("comma", FUNC(rs232_port_device::write_dtr));
+	rs232_port_device &commA(RS232_PORT(config, "comma", default_rs232_devices, "null_modem"));
+	commA.rxd_handler().set(m_scc, FUNC(scc8530_device::rxa_w));
 
 	// 8250-compatible UART at 0x3f8, with the usual 1.8432 MHz clock
 	INS8250(config, m_uart, 1'843'200);
