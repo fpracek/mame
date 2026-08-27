@@ -823,9 +823,22 @@ OP( 0xff, i_ffpre ) { uint32_t tmp, tmp1; GetModRM; tmp=GetRMWord(ModRM);
 		case 0x00: tmp1 = tmp+1; m_OverVal = (tmp==0x7fff); SetAF(tmp1,tmp,1); SetSZPF_Word(tmp1); PutbackRMWord(ModRM,(WORD)tmp1); CLKM(2,2,2,24,16,7); break; /* INC */
 		case 0x08: tmp1 = tmp-1; m_OverVal = (tmp==0x8000); SetAF(tmp1,tmp,1); SetSZPF_Word(tmp1); PutbackRMWord(ModRM,(WORD)tmp1); CLKM(2,2,2,24,16,7); break; /* DEC */
 		case 0x10: PUSH(m_ip); m_ip = (WORD)tmp; CHANGE_PC; CLK((ModRM >= 0xc0) ? 16 : 20); break; /* CALL */
-		case 0x18: tmp1 = Sreg(PS); Sreg(PS) = GetnextRMWord; PUSH(tmp1); PUSH(m_ip); m_ip = tmp; CHANGE_PC; CLK((ModRM >= 0xc0) ? 16 : 26); break; /* CALL FAR */
-		case 0x20: m_ip = tmp; CHANGE_PC; CLK(13); break; /* JMP */
-		case 0x28: m_ip = tmp; Sreg(PS) = GetnextRMWord; CHANGE_PC; CLK(15); break; /* JMP FAR */
+		// CALL FAR / JMP / JMP FAR indirect-via-memory: these three cases
+		// used flat, chip-type-independent constants (26/13/15) well
+		// below the databook-verified 8086 timing that MAME's own i86.cpp
+		// core carries for the same forms (CALL_M32=37, JMP_R16=11,
+		// JMP_M16=18, JMP_M32=24 - see src/devices/cpu/i86/i86.cpp's
+		// m_i8086_timing table, "indirect JMPs"/"indirect CALLs" rows).
+		// JMP indirect (0x20) additionally had no register/memory split
+		// at all despite the two forms costing a different number of
+		// cycles on real 8086-family silicon. Brought in line with that
+		// reference for all three chip types; no V30-specific reduction
+		// applied here since there's no verified V30 number for these
+		// particular forms (unlike the direct far call at 0x9A, which
+		// does carry an odd/even-address V30 discount).
+		case 0x18: tmp1 = Sreg(PS); Sreg(PS) = GetnextRMWord; PUSH(tmp1); PUSH(m_ip); m_ip = tmp; CHANGE_PC; CLKM(16,16,16,37,37,37); break; /* CALL FAR */
+		case 0x20: m_ip = tmp; CHANGE_PC; CLKM(11,11,11,18,18,18); break; /* JMP */
+		case 0x28: m_ip = tmp; Sreg(PS) = GetnextRMWord; CHANGE_PC; CLKM(15,15,15,24,24,24); break; /* JMP FAR */
 		case 0x30: PUSH(tmp); CLK(4); break;
 		default:   logerror("%06x: FF Pre with unimplemented mod\n",PC());
 	}
