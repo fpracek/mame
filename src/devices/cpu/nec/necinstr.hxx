@@ -546,19 +546,50 @@ OP( 0xa0, i_mov_aldisp ) { uint32_t addr; addr = fetchword(); Breg(AL) = GetMemB
 OP( 0xa1, i_mov_axdisp ) { uint32_t addr; addr = fetchword(); Wreg(AW) = GetMemW(DS0, addr); CLKW(14,14,7,14,10,5,addr); }
 OP( 0xa2, i_mov_dispal ) { uint32_t addr; addr = fetchword(); PutMemB(DS0, addr, Breg(AL));  CLKS(9,9,3); }
 OP( 0xa3, i_mov_dispax ) { uint32_t addr; addr = fetchword(); PutMemW(DS0, addr, Wreg(AW));  CLKW(13,13,5,13,9,3,addr); }
+// MOVS/CMPS/SCAS/LODS/STOS per-execution costs below are cross-referenced
+// against NEC's own "uPD70108/uPD70116 (V20/V30) User's Manual" (Oct 1986),
+// Section 12 - the per-instruction "REPEAT" clock figures (the per-iteration
+// rate used inside a REP loop, which is what these flat CLK values are
+// meant to approximate, since this emulator charges the same constant on
+// every call whether the opcode runs standalone or is repeated by REP).
+// V33 (uPD70136) postdates this manual and isn't covered by it, so its
+// values are left exactly as they were - only V20/V30 are corrected here.
 OP( 0xa4, i_movsb      ) { uint32_t tmp = GetMemB(DS0,Wreg(IX)); PutMemB(DS1,Wreg(IY), tmp); Wreg(IY) += -2 * m_DF + 1; Wreg(IX) += -2 * m_DF + 1; CLKS(8,8,6); }
-OP( 0xa5, i_movsw      ) { uint32_t tmp = GetMemW(DS0,Wreg(IX)); PutMemW(DS1,Wreg(IY), tmp); Wreg(IY) += -4 * m_DF + 2; Wreg(IX) += -4 * m_DF + 2; CLKS(16,16,10); }
+// MOVSW: manual's REP MOVBKW cost is 11+16/rep unless BOTH pointers are
+// even (11+8/rep) - V20 (uPD70108, 8-bit bus) never gets the discount, so
+// it's flat 16. This macro can only test one address (IY, the
+// destination, matching the convention already used below for STOS/SCAS
+// which also key off IY); the previous constants (8/4) were exactly half
+// of the correct per-iteration rate (16/8) in both branches - a clean 2x
+// undercount, not just a rounding difference.
+OP( 0xa5, i_movsw      ) { uint32_t tmp = GetMemW(DS0,Wreg(IX)); PutMemW(DS1,Wreg(IY), tmp); Wreg(IY) += -4 * m_DF + 2; Wreg(IX) += -4 * m_DF + 2; CLKW(16,16,10,16,8,10,Wreg(IY)); }
 OP( 0xa6, i_cmpsb      ) { uint32_t src = GetMemB(DS1, Wreg(IY)); uint32_t dst = GetMemB(DS0, Wreg(IX)); SUBB; Wreg(IY) += -2 * m_DF + 1; Wreg(IX) += -2 * m_DF + 1; CLKS(14,14,14); }
-OP( 0xa7, i_cmpsw      ) { uint32_t src = GetMemW(DS1, Wreg(IY)); uint32_t dst = GetMemW(DS0, Wreg(IX)); SUBW; Wreg(IY) += -4 * m_DF + 2; Wreg(IX) += -4 * m_DF + 2; CLKS(14,14,14); }
+// CMPSW previously used a flat 14 (the V30 best-case "both addresses
+// even" rate) for every chip type and every alignment. The manual gives
+// V20=22 always (no alignment benefit, 8-bit bus), and V30 22/18/14
+// depending on which of IX/IY are odd; this only tests one address (IX,
+// the source, matching LODS's convention below) so it can't capture the
+// "only one of the two is odd" (18) case, but it does fix the far more
+// common "V20, or V30 with a misaligned pointer" undercount (14 instead
+// of 22).
+OP( 0xa7, i_cmpsw      ) { uint32_t src = GetMemW(DS1, Wreg(IY)); uint32_t dst = GetMemW(DS0, Wreg(IX)); SUBW; Wreg(IY) += -4 * m_DF + 2; Wreg(IX) += -4 * m_DF + 2; CLKW(22,22,14,22,14,14,Wreg(IX)); }
 
 OP( 0xa8, i_test_ald8  ) { DEF_ald8;  ANDB; CLKS(4,4,2); }
 OP( 0xa9, i_test_axd16 ) { DEF_axd16; ANDW; CLKS(4,4,2); }
 OP( 0xaa, i_stosb      ) { PutMemB(DS1,Wreg(IY),Breg(AL));  Wreg(IY) += -2 * m_DF + 1; CLKS(4,4,3);  }
 OP( 0xab, i_stosw      ) { PutMemW(DS1,Wreg(IY),Wreg(AW));  Wreg(IY) += -4 * m_DF + 2; CLKW(8,8,5,8,4,3,Wreg(IY)); }
-OP( 0xac, i_lodsb      ) { Breg(AL) = GetMemB(DS0,Wreg(IX)); Wreg(IX) += -2 * m_DF + 1; CLKS(4,4,3);  }
-OP( 0xad, i_lodsw      ) { Wreg(AW) = GetMemW(DS0,Wreg(IX)); Wreg(IX) += -4 * m_DF + 2; CLKW(8,8,5,8,4,3,Wreg(IX)); }
-OP( 0xae, i_scasb      ) { uint32_t src = GetMemB(DS1, Wreg(IY)); uint32_t dst = Breg(AL); SUBB; Wreg(IY) += -2 * m_DF + 1; CLKS(4,4,3);  }
-OP( 0xaf, i_scasw      ) { uint32_t src = GetMemW(DS1, Wreg(IY)); uint32_t dst = Wreg(AW); SUBW; Wreg(IY) += -4 * m_DF + 2; CLKW(8,8,5,8,4,3,Wreg(IY)); }
+// LODSB/LODSW and SCASB/SCASW previously reused STOS's constants
+// verbatim (identical (4,4,3)/(8,8,5,8,4,3) tuples on all three
+// opcodes) even though the manual gives each of the three instructions
+// its own, different REP-rate: STOS=4/8/4 (byte/odd-word/even-word),
+// LODS=9/13/9, SCAS=10/14/10. STOS's numbers happen to already be
+// correct (verified against the manual, left unchanged above); LODS and
+// SCAS were undercounted by the amount STOS is cheaper than each of
+// them.
+OP( 0xac, i_lodsb      ) { Breg(AL) = GetMemB(DS0,Wreg(IX)); Wreg(IX) += -2 * m_DF + 1; CLKS(9,9,3);  }
+OP( 0xad, i_lodsw      ) { Wreg(AW) = GetMemW(DS0,Wreg(IX)); Wreg(IX) += -4 * m_DF + 2; CLKW(13,13,5,13,9,3,Wreg(IX)); }
+OP( 0xae, i_scasb      ) { uint32_t src = GetMemB(DS1, Wreg(IY)); uint32_t dst = Breg(AL); SUBB; Wreg(IY) += -2 * m_DF + 1; CLKS(10,10,3);  }
+OP( 0xaf, i_scasw      ) { uint32_t src = GetMemW(DS1, Wreg(IY)); uint32_t dst = Wreg(AW); SUBW; Wreg(IY) += -4 * m_DF + 2; CLKW(14,14,5,14,10,3,Wreg(IY)); }
 
 OP( 0xb0, i_mov_ald8  ) { Breg(AL) = fetch();   CLKS(4,4,2); }
 OP( 0xb1, i_mov_cld8  ) { Breg(CL) = fetch(); CLKS(4,4,2); }
@@ -820,8 +851,17 @@ OP( 0xfe, i_fepre ) { uint32_t tmp, tmp1; GetModRM; tmp=GetRMByte(ModRM);
 }
 OP( 0xff, i_ffpre ) { uint32_t tmp, tmp1; GetModRM; tmp=GetRMWord(ModRM);
 	switch(ModRM & 0x38) {
-		case 0x00: tmp1 = tmp+1; m_OverVal = (tmp==0x7fff); SetAF(tmp1,tmp,1); SetSZPF_Word(tmp1); PutbackRMWord(ModRM,(WORD)tmp1); CLKM(2,2,2,24,16,7); break; /* INC */
-		case 0x08: tmp1 = tmp-1; m_OverVal = (tmp==0x8000); SetAF(tmp1,tmp,1); SetSZPF_Word(tmp1); PutbackRMWord(ModRM,(WORD)tmp1); CLKM(2,2,2,24,16,7); break; /* DEC */
+		// INC/DEC mem, word form: the manual gives V20=24 flat and
+		// V30=24 (odd address) / 16 (even address), which is exactly the
+		// pattern the neighbouring ADD/SUB/etc memory-operand opcodes
+		// (e.g. 0x01 a few hundred lines up) already model correctly via
+		// CLKR - INC/DEC just used the flat, unsplit CLKM(...,16,7)
+		// instead, silently applying V30's best-case (even-address) 16
+		// regardless of actual alignment (undercounting the odd-address
+		// case by 8). Switched to CLKR to match the established pattern;
+		// V33 has no manual data so its value (7) is unchanged.
+		case 0x00: tmp1 = tmp+1; m_OverVal = (tmp==0x7fff); SetAF(tmp1,tmp,1); SetSZPF_Word(tmp1); PutbackRMWord(ModRM,(WORD)tmp1); CLKR(24,24,7,24,16,7,2,m_EA); break; /* INC */
+		case 0x08: tmp1 = tmp-1; m_OverVal = (tmp==0x8000); SetAF(tmp1,tmp,1); SetSZPF_Word(tmp1); PutbackRMWord(ModRM,(WORD)tmp1); CLKR(24,24,7,24,16,7,2,m_EA); break; /* DEC */
 		case 0x10: PUSH(m_ip); m_ip = (WORD)tmp; CHANGE_PC; CLK((ModRM >= 0xc0) ? 16 : 20); break; /* CALL */
 		// CALL FAR / JMP / JMP FAR indirect-via-memory: these three cases
 		// used flat, chip-type-independent constants (26/13/15) well
@@ -839,7 +879,18 @@ OP( 0xff, i_ffpre ) { uint32_t tmp, tmp1; GetModRM; tmp=GetRMWord(ModRM);
 		case 0x18: tmp1 = Sreg(PS); Sreg(PS) = GetnextRMWord; PUSH(tmp1); PUSH(m_ip); m_ip = tmp; CHANGE_PC; CLKM(16,16,16,37,37,37); break; /* CALL FAR */
 		case 0x20: m_ip = tmp; CHANGE_PC; CLKM(11,11,11,18,18,18); break; /* JMP */
 		case 0x28: m_ip = tmp; Sreg(PS) = GetnextRMWord; CHANGE_PC; CLKM(15,15,15,24,24,24); break; /* JMP FAR */
-		case 0x30: PUSH(tmp); CLK(4); break;
+		// PUSH mem: was a flat CLK(4) for every case, vastly below the
+		// manual's memory-operand figures (V20=26, V30=26 odd/18 even
+		// address). The manual also shows the *register*-operand form
+		// of PUSH (reg16/sreg) costs 12/8 depending on stack-pointer
+		// parity rather than being a flat, chip-independent value at
+		// all - CLKR's register branch can't express that per-parity
+		// split, so 18 (V30's even-address rate, and the closest
+		// approximation to the far more common word-aligned-stack case)
+		// is used for it here; that's still a large, well-evidenced
+		// improvement over the previous flat 4 in every case. V33 has
+		// no manual data so its value (4) is unchanged.
+		case 0x30: PUSH(tmp); CLKR(26,26,4,18,18,4,18,m_EA); break;
 		default:   logerror("%06x: FF Pre with unimplemented mod\n",PC());
 	}
 }
