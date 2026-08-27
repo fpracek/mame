@@ -496,7 +496,13 @@ OP( 0x83, i_83pre   ) { uint32_t dst, src; GetModRM; dst = GetRMWord(ModRM); src
 
 OP( 0x84, i_test_br8  ) { DEF_br8;  ANDB;   CLKM(2,2,2,10,10,6);        }
 OP( 0x85, i_test_wr16 ) { DEF_wr16; ANDW;   CLKR(14,14,8,14,10,6,2,m_EA); }
-OP( 0x86, i_xchg_br8  ) { DEF_br8;  RegByte(ModRM)=dst; PutbackRMByte(ModRM,src); CLKM(3,3,3,16,18,8); }
+// Byte XCH mem,reg's V30 mem-branch value (18) didn't match either the
+// manual's flat 16 (byte-operand XCH mem forms have no V20/V30 split,
+// same as everywhere else byte memory forms were checked this
+// investigation) or its own word-form sibling at 0x87 just below, which
+// already correctly uses 16 for V30's even-address case. Small, isolated
+// 2-cycle overcount fixed to match.
+OP( 0x86, i_xchg_br8  ) { DEF_br8;  RegByte(ModRM)=dst; PutbackRMByte(ModRM,src); CLKM(3,3,3,16,16,8); }
 OP( 0x87, i_xchg_wr16 ) { DEF_wr16; RegWord(ModRM)=dst; PutbackRMWord(ModRM,src); CLKR(24,24,12,24,16,8,3,m_EA); }
 
 OP( 0x88, i_mov_br8   ) { uint8_t  src; GetModRM; src = RegByte(ModRM);   PutRMByte(ModRM,src);   CLKM(2,2,2,9,9,3);          }
@@ -534,7 +540,11 @@ OP( 0x96, i_xchg_axsi ) { XchgAWReg(IX); CLK(3); }
 OP( 0x97, i_xchg_axdi ) { XchgAWReg(IY); CLK(3); }
 
 OP( 0x98, i_cbw       ) { Breg(AH) = (Breg(AL) & 0x80) ? 0xff : 0;      CLK(2); }
-OP( 0x99, i_cwd       ) { Wreg(DW) = (Breg(AH) & 0x80) ? 0xffff : 0;    CLK(4); }
+// Manual gives CWD as data-dependent, "4 or 5"; this used the flat lower
+// bound instead of the upper/worst-case convention used everywhere else
+// in this file for data-dependent ranges (see MUL/DIV a few hundred
+// lines down). Tiny (1-cycle) magnitude, fixed anyway for consistency.
+OP( 0x99, i_cwd       ) { Wreg(DW) = (Breg(AH) & 0x80) ? 0xffff : 0;    CLK(5); }
 OP( 0x9a, i_call_far  ) { uint32_t tmp, tmp2; tmp = fetchword(); tmp2 = fetchword(); PUSH(Sreg(PS)); PUSH(m_ip); m_ip = (WORD)tmp; Sreg(PS) = (WORD)tmp2; CHANGE_PC; CLKW(29,29,13,29,21,9,Wreg(SP)); }
 OP( 0x9b, i_wait      ) { if (!m_poll_state) m_ip--; CLK(5); }
 OP( 0x9c, i_pushf     ) { uint16_t tmp = CompressFlags(); PUSH( tmp ); CLKS(12,8,3); }
@@ -691,17 +701,23 @@ OP( 0xcf, i_iret      ) { POP(m_ip); POP(Sreg(PS)); i_popf(); CHANGE_PC; CLKS(39
 // log -p --follow and a content pickaxe search across 100k+ commits of
 // local history (back to at least 2011) show this exact constant has
 // never been modified - no commit, message, or nearby code comment
-// explains or justifies it, unlike MUL/DIV a little further down in this
-// same file where the author *did* leave detailed odd/even-address notes
-// for known-uncertain cases. nec.cpp's own file header states plainly
-// this core is "99% accurate...there are still some complex situations
-// where cycle counts are wrong" with an open "Todo: double check cycle
-// timing is 100%" from the original 2000 rewrite - and every other
-// register-direct ModRM opcode already audited in this file (ADD, MOV,
-// INC, TEST reg,reg) is correctly 2, so this is the outlier, not the
-// established pattern. Memory-operand branch (16,16,7 / 24,16,7 below)
-// is untouched - out of scope for this pass, though it may have its own,
-// separate V30 odd/even-address gap worth a future look.
+// explains or justifies it. (An earlier version of this comment cited
+// "MUL/DIV" as having such odd/even-address notes elsewhere in the file;
+// that was a misattribution on read-back - those detailed notes actually
+// sit on the INS/EXT bit-field instructions above, not MUL/DIV. MUL/DIV
+// turned out to have their own, different bug - see the fix a few
+// screens down.) nec.cpp's own file header states plainly this core is
+// "99% accurate...there are still some complex situations where cycle
+// counts are wrong" with an open "Todo: double check cycle timing is
+// 100%" from the original 2000 rewrite - and every other register-direct
+// ModRM opcode already audited in this file (ADD, MOV, INC, TEST reg,reg)
+// is correctly 2, so this was the outlier, not the established pattern.
+//
+// Memory-operand branch, byte form: manual gives a flat 16 with no
+// V20/V30 distinction for the byte-operand memory form (checked all 7
+// sub-ops individually, not just SHL - ROL/ROR/ROLC/RORC/SHR/SHRA mem,1
+// all read "When W=0: 16" uniformly), which is exactly what this already
+// models. No change needed here.
 OP( 0xd0, i_rotshft_b ) {
 	uint32_t src, dst; GetModRM; src = (uint32_t)GetRMByte(ModRM); dst=src;
 	CLKM(2,2,2,16,16,7);
@@ -717,11 +733,22 @@ OP( 0xd0, i_rotshft_b ) {
 	}
 }
 
-// Same register-direct fix as 0xd0 above (word form; manual gives no
-// byte/word distinction for the register-direct single-bit form).
+// Register-direct branch: same fix as 0xd0 above (word form; manual
+// gives no byte/word distinction for the register-direct single-bit
+// form, so it's the same flat 2 for all three chip types).
+//
+// Memory-operand branch: manual gives V20=24 flat and V30=24 (odd
+// address) / 16 (even address) for all 7 sub-ops' mem,1 word form
+// (checked individually, same as the byte form above) - this was
+// CLKM's flat, unsplit 16 for V30, i.e. always the even-address best
+// case, the same "silently even-only" gap already found and fixed via
+// CLKR in INC/DEC mem and PUSH mem a couple of rounds ago. Since the
+// register-direct branch is now a uniform 2 across V20/V30/V33 (per the
+// fix above), CLKR's single flat "vall" register-form slot can still
+// exactly represent it.
 OP( 0xd1, i_rotshft_w ) {
 	uint32_t src, dst; GetModRM; src = (uint32_t)GetRMWord(ModRM); dst=src;
-	CLKM(2,2,2,24,16,7);
+	CLKR(24,24,7,24,16,7,2,m_EA);
 	switch (ModRM & 0x38) {
 		case 0x00: ROL_WORD;  PutbackRMWord(ModRM,(WORD)dst); m_OverVal = (src^dst)&0x8000; break;
 		case 0x08: ROR_WORD;  PutbackRMWord(ModRM,(WORD)dst); m_OverVal = (src^dst)&0x8000; break;
@@ -795,6 +822,29 @@ OP( 0xf2, i_repne    ) { do_repne(start_rep()); }
 OP( 0xf3, i_repe     ) { do_repe(start_rep()); }
 OP( 0xf4, i_hlt ) { m_halted=1; m_icount=0; }
 OP( 0xf5, i_cmc ) { m_CarryVal = !CF; CLK(2); }
+// MULU/MUL/DIVU/DIV byte forms (this opcode) had been charging exactly
+// the same V20/V30 constants as the WORD forms at 0xf7 below - only the
+// V33 slot differed between the two, everything else was copy-pasted.
+// NEC's manual (Section 12) confirms real V20/V30 byte-operand
+// multiply/divide is genuinely cheaper than the word form (fewer
+// bits to shift-and-add/subtract), and gives no V20-vs-V30 distinction
+// at all for byte operands (register OR memory) - unlike several word
+// forms in this same group, which do differ by chip/address parity.
+// MULU/MUL/DIV are explicitly data-dependent on real hardware ("21 or
+// 22", "33 to 39", etc.) but this file has no precedent anywhere for
+// modelling that - every other data-dependent range in this exact
+// group (the WORD forms just below) is already approximated with a
+// single flat value at the top/worst-case end of its documented range,
+// so the byte-form fix below follows that same established convention
+// rather than introducing a new modelling approach:
+//   MULU reg8/mem8: 21-22 / 27-28  -> 22 / 28
+//   MUL   reg8/mem8: 33-39 / 39-45  -> 39 / 45
+//   DIVU  reg8/mem8: 19 (fixed) / 25 (fixed) -> 19 / 25 (not a range,
+//     unlike the signed forms - real DIVU has no early-out/negation step)
+//   DIV   reg8/mem8: 29-34 / 35-40  -> 34 / 40
+// (mem forms also lose the V20 vs V30 split of 57/53, 53/49 etc. that
+// had been inherited from the word form - the manual has no such split
+// for byte-operand memory forms.)
 OP( 0xf6, i_f6pre ) { uint32_t tmp; uint32_t uresult,uresult2; int32_t result,result2;
 	GetModRM; tmp = GetRMByte(ModRM);
 	switch (ModRM & 0x38) {
@@ -802,8 +852,8 @@ OP( 0xf6, i_f6pre ) { uint32_t tmp; uint32_t uresult,uresult2; int32_t result,re
 		case 0x08: logerror("%06x: Undefined opcode 0xf6 0x08\n",PC()); break;
 		case 0x10: PutbackRMByte(ModRM,~tmp); CLK((ModRM >= 0xc0) ? 2 : 16); break; /* NOT */
 		case 0x18: m_CarryVal=(tmp!=0); tmp=(~tmp)+1; SetSZPF_Byte(tmp); PutbackRMByte(ModRM,tmp&0xff); CLK((ModRM >= 0xc0) ? 2 : 16); break; /* NEG */
-		case 0x20: uresult = Breg(AL)*tmp; Wreg(AW)=(WORD)uresult; m_CarryVal=m_OverVal=(Breg(AH)!=0); CLKM(30,30,8,36,36,12); break; /* MULU */
-		case 0x28: result = (int16_t)((int8_t)Breg(AL))*(int16_t)((int8_t)tmp); Wreg(AW)=(WORD)result; m_CarryVal=m_OverVal=(Breg(AH)!=0); CLKM(47,47,8,57,53,12); break; /* MUL */
+		case 0x20: uresult = Breg(AL)*tmp; Wreg(AW)=(WORD)uresult; m_CarryVal=m_OverVal=(Breg(AH)!=0); CLKM(22,22,8,28,28,12); break; /* MULU */
+		case 0x28: result = (int16_t)((int8_t)Breg(AL))*(int16_t)((int8_t)tmp); Wreg(AW)=(WORD)result; m_CarryVal=m_OverVal=(Breg(AH)!=0); CLKM(39,39,8,45,45,12); break; /* MUL */
 		case 0x30:
 			if (tmp)
 				DIVUB
@@ -813,7 +863,7 @@ OP( 0xf6, i_f6pre ) { uint32_t tmp; uint32_t uresult,uresult2; int32_t result,re
 				nec_interrupt(NEC_DIVIDE_VECTOR, BRK);
 			}
 
-			CLKM(25,25,11,35,31,15);
+			CLKM(19,19,11,25,25,15);
 			break;
 		case 0x38:
 			if (tmp)
@@ -824,7 +874,7 @@ OP( 0xf6, i_f6pre ) { uint32_t tmp; uint32_t uresult,uresult2; int32_t result,re
 				nec_interrupt(NEC_DIVIDE_VECTOR, BRK);
 			}
 
-			CLKM(43,43,17,53,49,20);
+			CLKM(34,34,17,40,40,20);
 			break;
 	}
 }
@@ -836,7 +886,13 @@ OP( 0xf7, i_f7pre   ) { uint32_t tmp,tmp2; uint32_t uresult,uresult2; int32_t re
 		case 0x08: logerror("%06x: Undefined opcode 0xf7 0x08\n",PC()); break;
 		case 0x10: PutbackRMWord(ModRM,~tmp); CLK((ModRM >= 0xc0) ? 2 : 16); break; /* NOT */
 		case 0x18: m_CarryVal=(tmp!=0); tmp=(~tmp)+1; SetSZPF_Word(tmp); PutbackRMWord(ModRM,tmp&0xffff); CLK((ModRM >= 0xc0) ? 2 : 16); break; /* NEG */
-		case 0x20: uresult = Wreg(AW)*tmp; Wreg(AW)=uresult&0xffff; Wreg(DW)=((uint32_t)uresult)>>16; m_CarryVal=m_OverVal=(Wreg(DW)!=0); CLKM(30,30,12,36,36,16); break; /* MULU */
+		// MULU mem16's V30 slot (36) had been used unchanged for both
+		// V20 and V30, unlike its three siblings just below (MUL,
+		// DIVU, DIV) which all correctly differ V20 from V30 for the
+		// word memory form. Manual: V20=39-40 flat, V30=39-40 (odd) /
+		// 35-36 (even) - so V20 wants the word-form's own worst case
+		// (40), not the value borrowed from V30's even-address case.
+		case 0x20: uresult = Wreg(AW)*tmp; Wreg(AW)=uresult&0xffff; Wreg(DW)=((uint32_t)uresult)>>16; m_CarryVal=m_OverVal=(Wreg(DW)!=0); CLKM(30,30,12,40,36,16); break; /* MULU */
 		case 0x28: result = (int32_t)((int16_t)Wreg(AW))*(int32_t)((int16_t)tmp); Wreg(AW)=result&0xffff; Wreg(DW)=result>>16; m_CarryVal=m_OverVal=(Wreg(DW)!=0); CLKM(47,47,12,57,53,16); break; /* MUL */
 		case 0x30:
 			if (tmp)
