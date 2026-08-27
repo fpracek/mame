@@ -653,8 +653,17 @@ OP( 0xc1, i_rotshft_wd8 ) {
 	}
 }
 
-OP( 0xc2, i_ret_d16  ) { uint32_t count = fetch(); count += fetch() << 8; POP(m_ip); Wreg(SP)+=count; CHANGE_PC; CLKS(24,24,10); }
-OP( 0xc3, i_ret      ) { POP(m_ip); CHANGE_PC; CLKS(19,19,10); }
+// RET/RETF (all 4 forms, this one and the 3 more at 0xc3/0xca/0xcb)
+// show the exact same pattern just found and fixed on IRET: NEC's
+// manual (RET near/far, with/without a pop-value operand) gives V20
+// flat and correctly matches what was already here in every case, but
+// V30 splits by SP address parity (odd/even) and these were all flat
+// at the odd-address (more expensive) value instead of splitting - the
+// common case (word-aligned SP) is the cheaper even-address number.
+// Manual: RET near, pop-value: V20=24, V30 odd=24/even=20.
+OP( 0xc2, i_ret_d16  ) { uint32_t count = fetch(); count += fetch() << 8; POP(m_ip); Wreg(SP)+=count; CHANGE_PC; CLKW(24,24,10,24,20,10,Wreg(SP)); }
+// Manual: RET near, no operand: V20=19, V30 odd=19/even=15.
+OP( 0xc3, i_ret      ) { POP(m_ip); CHANGE_PC; CLKW(19,19,10,19,15,10,Wreg(SP)); }
 OP( 0xc4, i_les_dw   ) { GetModRM; WORD tmp = GetRMWord(ModRM); RegWord(ModRM)=tmp; Sreg(DS1) = GetnextRMWord; CLKW(26,26,14,26,18,10,m_EA); }
 OP( 0xc5, i_lds_dw   ) { GetModRM; WORD tmp = GetRMWord(ModRM); RegWord(ModRM)=tmp; Sreg(DS0) = GetnextRMWord; CLKW(26,26,14,26,18,10,m_EA); }
 OP( 0xc6, i_mov_bd8  ) { GetModRM; PutImmRMByte(ModRM); CLK((ModRM >=0xc0) ? 4 : 11); }
@@ -681,11 +690,41 @@ OP( 0xc9, i_leave ) {
 	POP(Wreg(BP));
 	CLK(8);
 }
-OP( 0xca, i_retf_d16  ) { uint32_t count = fetch(); count += fetch() << 8; POP(m_ip); POP(Sreg(PS)); Wreg(SP)+=count; CHANGE_PC; CLKS(32,32,16); }
-OP( 0xcb, i_retf      ) { POP(m_ip); POP(Sreg(PS)); CHANGE_PC; CLKS(29,29,16); }
+// Same RET/RETF fix as 0xc2/0xc3 above, far forms. Manual: RET far,
+// pop-value: V20=32, V30 odd=32/even=24.
+OP( 0xca, i_retf_d16  ) { uint32_t count = fetch(); count += fetch() << 8; POP(m_ip); POP(Sreg(PS)); Wreg(SP)+=count; CHANGE_PC; CLKW(32,32,16,32,24,16,Wreg(SP)); }
+// Manual: RET far, no operand: V20=29, V30 odd=29/even=21.
+OP( 0xcb, i_retf      ) { POP(m_ip); POP(Sreg(PS)); CHANGE_PC; CLKW(29,29,16,29,21,16,Wreg(SP)); }
 OP( 0xcc, i_int3      ) { nec_interrupt(3, BRK); CLKS(50,50,24); }
 OP( 0xcd, i_int       ) { nec_interrupt(fetch(), BRK); CLKS(50,50,24); }
 OP( 0xce, i_into      ) { if (OF) { nec_interrupt(NEC_BRKV_VECTOR, BRK); CLKS(52,52,26); } else CLK(3); }
+// Revisited (again): three rounds ago this was checked only against
+// i86.cpp's Intel 8086 reference (32) as a fallback proxy, found to be
+// an OVER-count relative to that, and set aside. This round, checked
+// against the actual NEC manual (RETI, its own name for IRET): V20=39
+// flat - matches what's already here - but V30 splits 39 (odd SP) / 27
+// (even SP), which this flat CLKS(39,39,...) doesn't model. That part
+// is genuine and well-evidenced (same manual, same technique as the
+// RET/RETF fix just above, which IS safe and stays applied).
+//
+// BUT: implementing the V30 split here (tried as CLKW(39,39,19,39,27,
+// 19,Wreg(SP)), i.e. -12 cycles on the common even-SP case) caused a
+// confirmed, reproducible regression under the exact WLTCDIAG
+// reproduction sequence - INTERRUPT CONTROL, which passes on every
+// prior round's baseline, started failing instead of DMA CONTROL.
+// Bisected by reverting IRET alone while keeping RET/RETF applied:
+// behaviour returned to normal (PROGRAMMABLE TIMER passes, DMA CONTROL
+// fails as always) with IRET reverted, confirming IRET specifically -
+// not RET/RETF - is responsible. Left at the original flat 39 per the
+// "revert and report rather than ship a net trade-off" rule. This
+// strongly suggests INTERRUPT CONTROL's current pass is itself
+// accidentally propped up by this same overcount (i.e. there is likely
+// a *different*, still-undiagnosed bug elsewhere - possibly in the
+// interrupt controller/PIC chain in wltc.cpp, or another instruction on
+// the interrupt-return path - that this correct IRET timing exposes),
+// mirroring the DMA CONTROL situation this whole investigation started
+// from. Worth its own dedicated round rather than reverting-and-losing
+// this finding entirely.
 OP( 0xcf, i_iret      ) { POP(m_ip); POP(Sreg(PS)); i_popf(); CHANGE_PC; CLKS(39,39,19); }
 
 // Register-direct branch of ROL/ROR/ROLC(RCL)/RORC(RCR)/SHL/SHR/SHRA(SAR)
