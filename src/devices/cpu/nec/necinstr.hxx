@@ -678,9 +678,33 @@ OP( 0xcd, i_int       ) { nec_interrupt(fetch(), BRK); CLKS(50,50,24); }
 OP( 0xce, i_into      ) { if (OF) { nec_interrupt(NEC_BRKV_VECTOR, BRK); CLKS(52,52,26); } else CLK(3); }
 OP( 0xcf, i_iret      ) { POP(m_ip); POP(Sreg(PS)); i_popf(); CHANGE_PC; CLKS(39,39,19); }
 
+// Register-direct branch of ROL/ROR/ROLC(RCL)/RORC(RCR)/SHL/SHR/SHRA(SAR)
+// reg,1 was 6 for V20/V30 (V33 already correctly 2). Checked every one of
+// the 7 sub-operations individually against their own dedicated page in
+// NEC's uPD70108/uPD70116 manual, Section 12 (not just SHL, in case some
+// carry-involving form like ROLC/RORC genuinely differed) - all seven give
+// an unconditional "Clocks: 2" for the register form on both V20 and V30,
+// with no W=0/W=1 split (register-direct shift cost doesn't depend on
+// operand size) and no sub-opcode exception. MAME's independent i86.cpp
+// 8086 reference agrees (ROT_REG_1=2). Checked whether 6 might be a
+// deliberate, documented V-series quirk before touching this: git blame/
+// log -p --follow and a content pickaxe search across 100k+ commits of
+// local history (back to at least 2011) show this exact constant has
+// never been modified - no commit, message, or nearby code comment
+// explains or justifies it, unlike MUL/DIV a little further down in this
+// same file where the author *did* leave detailed odd/even-address notes
+// for known-uncertain cases. nec.cpp's own file header states plainly
+// this core is "99% accurate...there are still some complex situations
+// where cycle counts are wrong" with an open "Todo: double check cycle
+// timing is 100%" from the original 2000 rewrite - and every other
+// register-direct ModRM opcode already audited in this file (ADD, MOV,
+// INC, TEST reg,reg) is correctly 2, so this is the outlier, not the
+// established pattern. Memory-operand branch (16,16,7 / 24,16,7 below)
+// is untouched - out of scope for this pass, though it may have its own,
+// separate V30 odd/even-address gap worth a future look.
 OP( 0xd0, i_rotshft_b ) {
 	uint32_t src, dst; GetModRM; src = (uint32_t)GetRMByte(ModRM); dst=src;
-	CLKM(6,6,2,16,16,7);
+	CLKM(2,2,2,16,16,7);
 	switch (ModRM & 0x38) {
 		case 0x00: ROL_BYTE;  PutbackRMByte(ModRM,(BYTE)dst); m_OverVal = (src^dst)&0x80; break;
 		case 0x08: ROR_BYTE;  PutbackRMByte(ModRM,(BYTE)dst); m_OverVal = (src^dst)&0x80; break;
@@ -693,9 +717,11 @@ OP( 0xd0, i_rotshft_b ) {
 	}
 }
 
+// Same register-direct fix as 0xd0 above (word form; manual gives no
+// byte/word distinction for the register-direct single-bit form).
 OP( 0xd1, i_rotshft_w ) {
 	uint32_t src, dst; GetModRM; src = (uint32_t)GetRMWord(ModRM); dst=src;
-	CLKM(6,6,2,24,16,7);
+	CLKM(2,2,2,24,16,7);
 	switch (ModRM & 0x38) {
 		case 0x00: ROL_WORD;  PutbackRMWord(ModRM,(WORD)dst); m_OverVal = (src^dst)&0x8000; break;
 		case 0x08: ROR_WORD;  PutbackRMWord(ModRM,(WORD)dst); m_OverVal = (src^dst)&0x8000; break;
