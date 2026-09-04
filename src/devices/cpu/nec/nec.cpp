@@ -130,7 +130,6 @@ nec_common_device::nec_common_device(const machine_config &mconfig, device_type 
 	: cpu_device(mconfig, type, tag, owner, clock)
 	, m_program_config("program", ENDIANNESS_LITTLE, is_16bit ? 16 : 8, chip_type == V33_TYPE ? 24 : 20, 0, 20, chip_type == V33_TYPE ? 14 : 0)
 	, m_io_config("io", ENDIANNESS_LITTLE, is_16bit ? 16 : 8, 16, 0, internal_port_map)
-	, m_opcodes_config("opcodes", ENDIANNESS_LITTLE, is_16bit ? 16 : 8, chip_type == V33_TYPE ? 24 : 20, 0, 20, chip_type == V33_TYPE ? 14 : 0)
 	, m_prefetch_size(prefetch_size)
 	, m_prefetch_cycles(prefetch_cycles)
 	, m_chip_type(chip_type)
@@ -161,17 +160,10 @@ v30_device::v30_device(const machine_config &mconfig, const char *tag, device_t 
 
 device_memory_interface::space_config_vector nec_common_device::memory_space_config() const
 {
-	space_config_vector spaces = space_config_vector {
+	return space_config_vector {
 		std::make_pair(AS_PROGRAM, &m_program_config),
 		std::make_pair(AS_IO,      &m_io_config)
 	};
-	// AS_OPCODES only shows up if a driver actually mapped it (mirrors
-	// i8086_cpu_device's own has_configured_map(AS_OPCODES) check in
-	// src/devices/cpu/i86/i86.cpp) - every driver that doesn't is
-	// completely unaffected, still just AS_PROGRAM/AS_IO as before.
-	if (has_configured_map(AS_OPCODES))
-		spaces.push_back(std::make_pair(AS_OPCODES, &m_opcodes_config));
-	return spaces;
 }
 
 
@@ -522,26 +514,20 @@ void nec_common_device::device_start()
 	save_item(NAME(m_prefetch_reset));
 
 	m_program = &space(AS_PROGRAM);
-	// Falls back to m_program itself unless a driver explicitly mapped
-	// AS_OPCODES (see memory_space_config() and nec.h's m_opcodes
-	// comment) - for every driver that doesn't, m_opcodes IS m_program,
-	// so every branch below binds the cache to the exact same space
-	// object it always did.
-	m_opcodes = has_space(AS_OPCODES) ? &space(AS_OPCODES) : m_program;
-	if (m_opcodes->data_width() == 8)
+	if (m_program->data_width() == 8)
 	{
-		m_opcodes->cache(m_cache8);
+		m_program->cache(m_cache8);
 		m_dr8 = [this](offs_t address) -> u8 { return m_cache8.read_byte(address); };
 	}
 	else if (m_chip_type == V33_TYPE)
 	{
 		save_item(NAME(m_xa));
-		m_opcodes->cache(m_cache16);
+		m_program->cache(m_cache16);
 		m_dr8 = [this](offs_t address) -> u8 { return m_cache16.read_byte(v33_translate(address)); };
 	}
 	else
 	{
-		m_opcodes->cache(m_cache16);
+		m_program->cache(m_cache16);
 		m_dr8 = [this](offs_t address) -> u8 { return m_cache16.read_byte(address); };
 	}
 
