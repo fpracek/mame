@@ -65,6 +65,7 @@ protected:
 
 	address_space_config m_program_config;
 	address_space_config m_io_config;
+	address_space_config m_opcodes_config;
 
 private:
 	/* NEC registers */
@@ -103,6 +104,26 @@ private:
 	uint32_t  m_rep_params;
 
 	address_space *m_program;
+	// m_opcodes is where instruction FETCH reads from (via m_cache8/16
+	// below) - it's a SEPARATE, opt-in address space (AS_OPCODES),
+	// distinct from m_program's AS_PROGRAM which is what every regular
+	// data read/write (GetRMByte/GetRMWord/PutbackRM*) still goes
+	// through. Falls back to m_program itself when a driver never maps
+	// AS_OPCODES (the overwhelming majority - see device_start()), so
+	// this is fully backward compatible: unless a driver explicitly
+	// wires up AS_OPCODES, fetch and data are the same single space
+	// exactly as before this existed. Added so a driver CAN give
+	// instruction fetch different timing/wait-state behaviour than data
+	// access without that driver's choice ever being forced on anyone
+	// else - real V20/V30 hardware's bus-interface-unit fetch queue can
+	// often hide extra memory latency that a data read/write the
+	// execution unit is directly waiting on cannot, so the two aren't
+	// architecturally the same thing even though they share one address
+	// map in every driver that doesn't need to tell them apart. Mirrors
+	// the established i8086 core's own AS_OPCODES/m_opcodes pattern
+	// (src/devices/cpu/i86/i86.h, i86.cpp) rather than inventing a new
+	// convention.
+	address_space *m_opcodes;
 	memory_access<24, 0, 0, ENDIANNESS_LITTLE>::cache m_cache8;
 	memory_access<24, 1, 0, ENDIANNESS_LITTLE>::cache m_cache16;
 

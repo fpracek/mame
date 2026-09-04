@@ -1419,11 +1419,32 @@ private:
 	uint8_t m_ivt_seed_rom[0x240];
 
 	void mem_map(address_map &map) ATTR_COLD;
+	void opcodes_map(address_map &map) ATTR_COLD;
 	void io_map(address_map &map) ATTR_COLD;
 
 	// temporary reconnaissance handlers: log every I/O access with the PC
 	uint16_t io_r(offs_t offset, uint16_t mem_mask);
 	void io_w(offs_t offset, uint16_t data, uint16_t mem_mask);
+
+	// 640K conventional RAM, DATA-access path only (mem_map/AS_PROGRAM) -
+	// instruction FETCH from this same storage goes through opcodes_map/
+	// AS_OPCODES instead, a plain unpenalized .ram() view. Real-hardware
+	// measurement (V30BENCH.COM, INC [mem] @EVEN/@ODD, 2026-09-04) found
+	// data reads/writes here cost ~4 cycles more per access than the NEC
+	// manual's own V30 table value - on top of, not instead of, the
+	// odd/even bus-cycle split necinstr.hxx's CLKR already models
+	// correctly - while code fetch from the exact same physical RAM
+	// (SHL AX,1 @EVEN/@ODD; NOP; INC AX; ADD AL,imm8 all matching their
+	// documented cost with no such gap despite fetching from here
+	// millions of times) shows nothing of the kind. Best read as a real
+	// WLTC memory wait-state the BIU's prefetch queue can hide from
+	// fetch but the EU can't dodge when a data value is what it's
+	// actually waiting on. The 4-cycle figure is a best fit against two
+	// real-hardware data points (even ~22.9 vs documented 16, odd ~32.6
+	// vs documented 24), not a hardware-verified exact wait-state count -
+	// refine if a more direct measurement ever isolates it further.
+	uint16_t lowram_data_r(offs_t offset, uint16_t mem_mask = ~0);
+	void lowram_data_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
 
 	// F segment: reads come from the EPROMs (verified on real hardware),
 	// but the video subsystem accepts writes there (VRAM around 0xf2000,
@@ -2853,6 +2874,21 @@ uint32_t wltc_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 	return 0;
 }
 
+uint16_t wltc_state::lowram_data_r(offs_t offset, uint16_t mem_mask)
+{
+	// see the wait-state comment on the class declaration above
+	if (!machine().side_effects_disabled())
+		m_maincpu->eat_cycles(4);
+	return m_lowram[offset];
+}
+
+void wltc_state::lowram_data_w(offs_t offset, uint16_t data, uint16_t mem_mask)
+{
+	if (!machine().side_effects_disabled())
+		m_maincpu->eat_cycles(4);
+	COMBINE_DATA(&m_lowram[offset]);
+}
+
 uint16_t wltc_state::fseg_r(offs_t offset, uint16_t mem_mask)
 {
 	// The video memory window at 0xf2000-0xf3fff reads back what was
@@ -3433,7 +3469,12 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 		// far-jump stub table (offsets 4/9/E/13 -> E25F/E332/E17A/E610)
 		// that the vector-install path points interrupt vectors at, and
 		// executing template data there is what derailed the first try.
+		// Mirrored into AS_OPCODES too (see opcodes_map's comment) -
+		// this region genuinely gets executed, not just read as data,
+		// so instruction fetch needs to see the exact same override.
 		m_maincpu->space(AS_PROGRAM).install_rom(0x00420, 0x01a2f,
+				memregion("bios")->base() + 0x35f0 + 0x20);
+		m_maincpu->space(AS_OPCODES).install_rom(0x00420, 0x01a2f,
 				memregion("bios")->base() + 0x35f0 + 0x20);
 		m_boot_mirror = false;
 	}
@@ -3444,16 +3485,27 @@ void wltc_state::io_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 	// the POST, now running from the E alias, can pattern-test it
 	// destructively; 0x1f (bit 0 set) puts the EPROM back and execution
 	// returns to F000:0326 expecting its code there. Without the switch
-	// the return lands in the test-wiped RAM and marches.
+	// the return lands in the test-wiped RAM and marches. Both branches
+	// also mirrored into AS_OPCODES - the POST executes code out of F
+	// segment in either mode, so instruction fetch must track whichever
+	// one is actually live exactly like data access does.
 	if (m_legacy_bios && (offset << 1) == 0x2d02 && !machine().side_effects_disabled())
 	{
 		m_fseg_ram = !(data & 1);
 		if (data & 1)
+		{
 			m_maincpu->space(AS_PROGRAM).install_rom(0xf0000, 0xfffff,
 					memregion("bios")->base() + 0x10000);
+			m_maincpu->space(AS_OPCODES).install_rom(0xf0000, 0xfffff,
+					memregion("bios")->base() + 0x10000);
+		}
 		else
+		{
 			m_maincpu->space(AS_PROGRAM).install_ram(0xf0000, 0xfffff,
 					reinterpret_cast<uint8_t *>(m_fram.target()));
+			m_maincpu->space(AS_OPCODES).install_ram(0xf0000, 0xfffff,
+					reinterpret_cast<uint8_t *>(m_fram.target()));
+		}
 	}
 
 	if ((offset << 1) == 0x2816 && ACCESSING_BITS_0_7)
@@ -3926,11 +3978,22 @@ void wltc_state::machine_reset()
 	// otherwise puts there, so the two purposes never alias the same
 	// bytes.
 	m_optram_installed = BIT(ioport("OPTRAM")->read(), 0);
+	// Mirrored into AS_OPCODES too, on general principle (RAM expansion
+	// blocks can legitimately hold loaded/executed DOS programs, not
+	// just data) even though this block isn't known to be POST-critical
+	// the way the F-segment and boot-overlay switches above are.
 	if (m_optram_installed)
+	{
 		m_maincpu->space(AS_PROGRAM).install_ram(0xa0000, 0xaffff, m_optram2);
+		m_maincpu->space(AS_OPCODES).install_ram(0xa0000, 0xaffff, m_optram2);
+	}
 	else
+	{
 		m_maincpu->space(AS_PROGRAM).install_ram(0xa0000, 0xaffff,
 				reinterpret_cast<uint8_t *>(m_fram.target()));
+		m_maincpu->space(AS_OPCODES).install_ram(0xa0000, 0xaffff,
+				reinterpret_cast<uint8_t *>(m_fram.target()));
+	}
 	m_kb_recipe_base = 0;
 	m_kb_recipe.clear();
 	m_is_arch_base = 0;
@@ -4029,6 +4092,7 @@ void wltc_state::machine_reset()
 		uint8_t *const fram = reinterpret_cast<uint8_t *>(m_fram.target());
 		memcpy(fram, memregion("bios")->base() + 0x10000, 0x10000);
 		m_maincpu->space(AS_PROGRAM).install_ram(0xf0000, 0xfffff, fram);
+		m_maincpu->space(AS_OPCODES).install_ram(0xf0000, 0xfffff, fram);
 		return;
 	}
 
@@ -4084,7 +4148,13 @@ void wltc_state::machine_reset()
 	// 0040:00A0 back as zeroed RAM under DOS - but nothing in the POST
 	// depends on that any more, now that the BIOS data segment is known
 	// to be E35F rather than 0x0040 (see the wait at E14A6 below).
+	// Read side mirrored into AS_OPCODES too - this overlay is exactly
+	// what the cold start executes out of (see the "genuine hardware,
+	// not scaffolding" note above), so instruction fetch must see the
+	// EPROM here just like a data read does. The write side never needs
+	// mirroring: fetch is read-only, nothing ever writes through it.
 	m_maincpu->space(AS_PROGRAM).install_rom(0x00400, 0x0f7ff, memregion("bios")->base());
+	m_maincpu->space(AS_OPCODES).install_rom(0x00400, 0x0f7ff, memregion("bios")->base());
 	m_maincpu->space(AS_PROGRAM).install_writeonly(0x00400, 0x0f7ff,
 			reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x400);
 	// The overlay wraps at 64K: physical 0x1000D reads ROM offset 0x0D,
@@ -4097,6 +4167,7 @@ void wltc_state::machine_reset()
 	// all, take the lock at [1128], pick one of two unit blocks at
 	// [112D]/[114C]. That call is the boot read.
 	m_maincpu->space(AS_PROGRAM).install_rom(0x10000, 0x103ff, memregion("bios")->base());
+	m_maincpu->space(AS_OPCODES).install_rom(0x10000, 0x103ff, memregion("bios")->base());
 	m_maincpu->space(AS_PROGRAM).install_writeonly(0x10000, 0x103ff,
 			reinterpret_cast<uint8_t *>(m_lowram.target()) + 0x10000);
 	m_boot_mirror = true;
@@ -4300,8 +4371,11 @@ void wltc_state::machine_reset()
 void wltc_state::mem_map(address_map &map)
 {
 	// 640K: the 1986 POST pattern-tests 0x00000-0x9ffff as one block
-	// and reports "51 Memory Error" if any of it fails to read back
-	map(0x00000, 0x9ffff).ram().share("lowram");
+	// and reports "51 Memory Error" if any of it fails to read back.
+	// DATA access only - see lowram_data_r/w's declaration comment for
+	// why this isn't a plain .ram() any more. Instruction fetch from
+	// this same physical storage goes through opcodes_map() below.
+	map(0x00000, 0x9ffff).rw(FUNC(wltc_state::lowram_data_r), FUNC(wltc_state::lowram_data_w)).share("lowram");
 	// CGA-style text buffer: the character output service runs with
 	// DS=B800 and 80-column rows, attribute 0x07 - the standard IBM
 	// text segment, kept by the BIOS as the source for the LCD refresh
@@ -4317,6 +4391,25 @@ void wltc_state::mem_map(address_map &map)
 	// data segment E35F there); F segment: reads from ROM (the real
 	// machine preserves the EPROM content at runtime, verified live),
 	// writes captured by the video-window handler.
+	map(0xe0000, 0xeffff).ram().share("shadow");
+	map(0xf0000, 0xfffff).rw(FUNC(wltc_state::fseg_r), FUNC(wltc_state::fseg_w));
+}
+
+// Instruction FETCH map (AS_OPCODES) - identical to mem_map() above in
+// every region except 0x00000-0x9ffff, which here is a plain, fast,
+// unpenalized .ram() view of the SAME "lowram" storage (no wait-state
+// cycles charged): the one difference this whole space exists for. The
+// BIOS genuinely executes code out of both 0xe0000-0xeffff (shadow RAM
+// patches) and 0xf0000-0xfffff (EPROM), so those keep the exact same
+// handlers as mem_map() - reusing fseg_r/fseg_w directly, not a copy -
+// otherwise fetching from there would see different bytes than a data
+// read of the same address would.
+void wltc_state::opcodes_map(address_map &map)
+{
+	map(0x00000, 0x9ffff).ram().share("lowram");
+	map(0xb0000, 0xb7fff).ram().share("monoram");
+	map(0xb8000, 0xbffff).ram().share("textram");
+	map(0xa0000, 0xaffff).ram().share("fram");
 	map(0xe0000, 0xeffff).ram().share("shadow");
 	map(0xf0000, 0xfffff).rw(FUNC(wltc_state::fseg_r), FUNC(wltc_state::fseg_w));
 }
@@ -4579,6 +4672,7 @@ void wltc_state::wltc(machine_config &config)
 	V30(config, m_maincpu, 8'000'000); // NEC D70116C-8
 	m_maincpu->set_addrmap(AS_PROGRAM, &wltc_state::mem_map);
 	m_maincpu->set_addrmap(AS_IO, &wltc_state::io_map);
+	m_maincpu->set_addrmap(AS_OPCODES, &wltc_state::opcodes_map);
 	m_maincpu->set_irq_acknowledge_callback(FUNC(wltc_state::irq_ack));
 
 	// The POST counts gate-array interrupts across software delay loops
