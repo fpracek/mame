@@ -757,6 +757,18 @@ OP( 0xcf, i_iret      ) { POP(m_ip); POP(Sreg(PS)); i_popf(); CHANGE_PC; CLKS(39
 // sub-ops individually, not just SHL - ROL/ROR/ROLC/RORC/SHR/SHRA mem,1
 // all read "When W=0: 16" uniformly), which is exactly what this already
 // models. No change needed here.
+//
+// SHL/SHR/SHRA double-charge: CLKM above already deposits the COMPLETE
+// flat cost for this fixed shift-by-1 form (same as ROL/ROR/ROLC/RORC,
+// which take nothing further). But SHL_BYTE/SHR_BYTE/SHRA_BYTE are the
+// SAME macros 0xd2 (shift-by-CL) uses, where they're called ONCE with
+// c=CL and their own embedded CLK(c) is the intended per-bit cost on top
+// of 0xd2's separate, smaller base charge. Reusing them here with c=1
+// makes them silently add one more CLK(1) after CLKM's already-total
+// value - found by comparing this to the 0xd2/0xd3 callers, not by the
+// real-hardware SHL AX,1 gap (that gap is much larger and unexplained by
+// this alone - see V30BENCH results). CLK(-1) below undoes just that
+// extra add, leaving ROL/ROR/ROLC/RORC (which never had it) untouched.
 OP( 0xd0, i_rotshft_b ) {
 	uint32_t src, dst; GetModRM; src = (uint32_t)GetRMByte(ModRM); dst=src;
 	CLKM(2,2,2,16,16,7);
@@ -765,10 +777,10 @@ OP( 0xd0, i_rotshft_b ) {
 		case 0x08: ROR_BYTE;  PutbackRMByte(ModRM,(BYTE)dst); m_OverVal = (src^dst)&0x80; break;
 		case 0x10: ROLC_BYTE; PutbackRMByte(ModRM,(BYTE)dst); m_OverVal = (src^dst)&0x80; break;
 		case 0x18: RORC_BYTE; PutbackRMByte(ModRM,(BYTE)dst); m_OverVal = (src^dst)&0x80; break;
-		case 0x20: SHL_BYTE(1); m_OverVal = (src^dst)&0x80; break;
-		case 0x28: SHR_BYTE(1); m_OverVal = (src^dst)&0x80; break;
+		case 0x20: SHL_BYTE(1); CLK(-1); m_OverVal = (src^dst)&0x80; break;
+		case 0x28: SHR_BYTE(1); CLK(-1); m_OverVal = (src^dst)&0x80; break;
 		case 0x30: logerror("%06x: Undefined opcode 0xd0 0x30 (SHLA)\n",PC()); break;
-		case 0x38: SHRA_BYTE(1); m_OverVal = 0; break;
+		case 0x38: SHRA_BYTE(1); CLK(-1); m_OverVal = 0; break;
 	}
 }
 
@@ -785,6 +797,11 @@ OP( 0xd0, i_rotshft_b ) {
 // register-direct branch is now a uniform 2 across V20/V30/V33 (per the
 // fix above), CLKR's single flat "vall" register-form slot can still
 // exactly represent it.
+// Same SHL/SHR/SHRA double-charge as 0xd0 above (see the comment there):
+// CLKR already deposits the complete flat/odd/even cost for this
+// fixed-shift-by-1 word form, and SHL_WORD/SHR_WORD/SHRA_WORD's own
+// embedded CLK(1) (there for 0xd3's shift-by-CL reuse) adds one more on
+// top. CLK(-1) undoes just that.
 OP( 0xd1, i_rotshft_w ) {
 	uint32_t src, dst; GetModRM; src = (uint32_t)GetRMWord(ModRM); dst=src;
 	CLKR(24,24,7,24,16,7,2,m_EA);
@@ -793,10 +810,10 @@ OP( 0xd1, i_rotshft_w ) {
 		case 0x08: ROR_WORD;  PutbackRMWord(ModRM,(WORD)dst); m_OverVal = (src^dst)&0x8000; break;
 		case 0x10: ROLC_WORD; PutbackRMWord(ModRM,(WORD)dst); m_OverVal = (src^dst)&0x8000; break;
 		case 0x18: RORC_WORD; PutbackRMWord(ModRM,(WORD)dst); m_OverVal = (src^dst)&0x8000; break;
-		case 0x20: SHL_WORD(1); m_OverVal = (src^dst)&0x8000;  break;
-		case 0x28: SHR_WORD(1); m_OverVal = (src^dst)&0x8000;  break;
+		case 0x20: SHL_WORD(1); CLK(-1); m_OverVal = (src^dst)&0x8000;  break;
+		case 0x28: SHR_WORD(1); CLK(-1); m_OverVal = (src^dst)&0x8000;  break;
 		case 0x30: logerror("%06x: Undefined opcode 0xd1 0x30 (SHLA)\n",PC()); break;
-		case 0x38: SHRA_WORD(1); m_OverVal = 0; break;
+		case 0x38: SHRA_WORD(1); CLK(-1); m_OverVal = 0; break;
 	}
 }
 
