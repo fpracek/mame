@@ -1017,10 +1017,34 @@ OP( 0xff, i_ffpre ) { uint32_t tmp, tmp1; GetModRM; tmp=GetRMWord(ModRM);
 		// begin with. Found while chasing why MISURA.COM's LOOP B (built
 		// almost entirely around the CALL FAR form) measured
 		// substantially slower in emulation than on two real WLTC
-		// units - switched all three to CLKR to carry the real splits.
-		// V33 has no manual data for any of them, so its values (37 /
-		// 18 / 24, unchanged) are still just carried over from the same
-		// 8086 reference as before, not verified.
+		// units - switched CALL FAR and JMP FAR to CLKR to carry their
+		// real splits (verified: WLTCDIAG's INTERRUPT CONTROL /
+		// PROGRAMMABLE TIMER / REFRESH CONTROL / I/O EMULATION still all
+		// pass with these two changed). V33 has no manual data for
+		// either, so its values (37 / 24, unchanged) are still just
+		// carried over from the same 8086 reference as before, not
+		// verified.
+		// JMP indirect (case 0x20, "BR memptr16") is the one exception:
+		// its own correct, manual-verified value (24 odd / 20 even, up
+		// from the placeholder 18 either way) demonstrably BREAKS
+		// WLTCDIAG's INTERRUPT CONTROL - bisected on 2026-09-05 by
+		// reverting each of the three opcodes individually against a
+		// real WLTCDIAG run (rev 2697): reverting only this one restores
+		// the previously-reliable pass (and the previously-reliable
+		// reach of DMA CONTROL beyond it); CALL FAR and JMP FAR keeping
+		// their new values changes nothing either way. INTERRUPT
+		// CONTROL's own pass criteria are a tight interrupt-count
+		// tolerance window, the same shape of fragility DMA CONTROL was
+		// already known for - but unlike DMA CONTROL, nobody has yet
+		// confirmed whether INTERRUPT CONTROL passes on real WLTC
+		// hardware, so there's no way yet to tell whether the OLD
+		// (wrong-per-manual) 18 happens to match real silicon's
+		// aggregate behaviour here, or whether this test is *also*
+		// written to a margin real hardware fails too and we've just
+		// traded one accepted gap for another. Left at the old flat 18
+		// deliberately rather than guessed at further - don't
+		// "re-fix" this without first getting a real-hardware answer
+		// for INTERRUPT CONTROL the way DMA CONTROL got one.
 		// The register-direct forms (BR regptr16 for JMP=case 0x20: a
 		// flat 11, matching what CLKM already had) aren't affected by
 		// any of this - CALL FAR/JMP FAR have no legitimate
@@ -1028,7 +1052,7 @@ OP( 0xff, i_ffpre ) { uint32_t tmp, tmp1; GetModRM; tmp=GetRMWord(ModRM);
 		// full CS:IP pair in one register), so their register-branch
 		// constants (16/15) are unreachable in practice and left as is.
 		case 0x18: tmp1 = Sreg(PS); Sreg(PS) = GetnextRMWord; PUSH(tmp1); PUSH(m_ip); m_ip = tmp; CHANGE_PC; CLKR(47,47,37,47,31,37,16,m_EA); break; /* CALL FAR */
-		case 0x20: m_ip = tmp; CHANGE_PC; CLKR(24,24,18,24,20,18,11,m_EA); break; /* JMP */
+		case 0x20: m_ip = tmp; CHANGE_PC; CLKM(11,11,11,18,18,18); break; /* JMP - see comment above: NOT switched to the verified-correct CLKR(24,24,18,24,20,18,11,m_EA), breaks INTERRUPT CONTROL */
 		case 0x28: m_ip = tmp; Sreg(PS) = GetnextRMWord; CHANGE_PC; CLKR(35,35,24,35,27,24,15,m_EA); break; /* JMP FAR */
 		// PUSH mem: was a flat CLK(4) for every case, vastly below the
 		// manual's memory-operand figures (V20=26, V30=26 odd/18 even
