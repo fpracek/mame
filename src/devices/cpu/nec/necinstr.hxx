@@ -1001,22 +1001,35 @@ OP( 0xff, i_ffpre ) { uint32_t tmp, tmp1; GetModRM; tmp=GetRMWord(ModRM);
 		case 0x00: tmp1 = tmp+1; m_OverVal = (tmp==0x7fff); SetAF(tmp1,tmp,1); SetSZPF_Word(tmp1); PutbackRMWord(ModRM,(WORD)tmp1); CLKR(24,24,7,24,16,7,2,m_EA); break; /* INC */
 		case 0x08: tmp1 = tmp-1; m_OverVal = (tmp==0x8000); SetAF(tmp1,tmp,1); SetSZPF_Word(tmp1); PutbackRMWord(ModRM,(WORD)tmp1); CLKR(24,24,7,24,16,7,2,m_EA); break; /* DEC */
 		case 0x10: PUSH(m_ip); m_ip = (WORD)tmp; CHANGE_PC; CLK((ModRM >= 0xc0) ? 16 : 20); break; /* CALL */
-		// CALL FAR / JMP / JMP FAR indirect-via-memory: these three cases
-		// used flat, chip-type-independent constants (26/13/15) well
-		// below the databook-verified 8086 timing that MAME's own i86.cpp
-		// core carries for the same forms (CALL_M32=37, JMP_R16=11,
-		// JMP_M16=18, JMP_M32=24 - see src/devices/cpu/i86/i86.cpp's
-		// m_i8086_timing table, "indirect JMPs"/"indirect CALLs" rows).
-		// JMP indirect (0x20) additionally had no register/memory split
-		// at all despite the two forms costing a different number of
-		// cycles on real 8086-family silicon. Brought in line with that
-		// reference for all three chip types; no V30-specific reduction
-		// applied here since there's no verified V30 number for these
-		// particular forms (unlike the direct far call at 0x9A, which
-		// does carry an odd/even-address V30 discount).
-		case 0x18: tmp1 = Sreg(PS); Sreg(PS) = GetnextRMWord; PUSH(tmp1); PUSH(m_ip); m_ip = tmp; CHANGE_PC; CLKM(16,16,16,37,37,37); break; /* CALL FAR */
-		case 0x20: m_ip = tmp; CHANGE_PC; CLKM(11,11,11,18,18,18); break; /* JMP */
-		case 0x28: m_ip = tmp; Sreg(PS) = GetnextRMWord; CHANGE_PC; CLKM(15,15,15,24,24,24); break; /* JMP FAR */
+		// CALL FAR / JMP / JMP FAR indirect-via-memory: a prior fix this
+		// session moved all three off flat, chip-independent
+		// placeholders onto MAME's i86.cpp 8086 reference (CALL_M32=37,
+		// JMP_M16=18, JMP_M32=24), on the stated grounds that no
+		// verified V30 number was on hand for these forms. All three
+		// numbers WERE on hand - just not looked at: NEC's own
+		// uPD70108/uPD70116 manual gives each its own entry, under its
+		// own "BR"/"CALL" mnemonics rather than Intel's "JMP":
+		//   CALL memptr32 (p.12-144): 47 V20, 47 V30-odd, 31 V30-even
+		//   BR memptr16   (p.12-155): 24 V20, 24 V30-odd, 20 V30-even
+		//   BR memptr32   (p.12-156): 35 V20, 35 V30-odd, 27 V30-even
+		// - each with a genuine odd/even split the flat CLKM used here
+		// could never express, on top of being the wrong magnitude to
+		// begin with. Found while chasing why MISURA.COM's LOOP B (built
+		// almost entirely around the CALL FAR form) measured
+		// substantially slower in emulation than on two real WLTC
+		// units - switched all three to CLKR to carry the real splits.
+		// V33 has no manual data for any of them, so its values (37 /
+		// 18 / 24, unchanged) are still just carried over from the same
+		// 8086 reference as before, not verified.
+		// The register-direct forms (BR regptr16 for JMP=case 0x20: a
+		// flat 11, matching what CLKM already had) aren't affected by
+		// any of this - CALL FAR/JMP FAR have no legitimate
+		// register-direct encoding at all (there's nowhere to hold a
+		// full CS:IP pair in one register), so their register-branch
+		// constants (16/15) are unreachable in practice and left as is.
+		case 0x18: tmp1 = Sreg(PS); Sreg(PS) = GetnextRMWord; PUSH(tmp1); PUSH(m_ip); m_ip = tmp; CHANGE_PC; CLKR(47,47,37,47,31,37,16,m_EA); break; /* CALL FAR */
+		case 0x20: m_ip = tmp; CHANGE_PC; CLKR(24,24,18,24,20,18,11,m_EA); break; /* JMP */
+		case 0x28: m_ip = tmp; Sreg(PS) = GetnextRMWord; CHANGE_PC; CLKR(35,35,24,35,27,24,15,m_EA); break; /* JMP FAR */
 		// PUSH mem: was a flat CLK(4) for every case, vastly below the
 		// manual's memory-operand figures (V20=26, V30=26 odd/18 even
 		// address). The manual also shows the *register*-operand form
